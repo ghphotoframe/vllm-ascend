@@ -33,6 +33,14 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     @property
     def page_size_bytes(self) -> int:
+        real_page_size = self.real_page_size_bytes
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= real_page_size
+            return self.page_size_padded
+        return real_page_size
+
+    @property
+    def real_page_size_bytes(self) -> int:
         return (
             self.block_size
             * self.num_kv_heads
@@ -73,6 +81,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             scale_dim=specs[0].scale_dim,
             scale_dtype=specs[0].scale_dtype,
             dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
         )
