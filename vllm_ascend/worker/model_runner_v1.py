@@ -4294,6 +4294,7 @@ class NPUModelRunner(GPUModelRunner):
                         head_size=head_size,
                         dtype=dtype,
                         cache_dtype_str=cache_dtype_str,
+                        page_size_padded=self.vllm_config.cache_config.mamba_page_size_padded,
                     )
                     attn_layer_names.add(layer_name)
 
