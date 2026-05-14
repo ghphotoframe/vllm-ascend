@@ -1760,7 +1760,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         # O proj
-        output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        if hasattr(self.o_proj, "output_size"):
+            o_proj_output = self.o_proj(
+                o_proj_input,
+                is_prefill=prefill_preprocess_res is not None,
+            )[0]
+        else:
+            o_proj_output = self.o_proj(o_proj_input)[0]
+        output[...] = o_proj_output
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

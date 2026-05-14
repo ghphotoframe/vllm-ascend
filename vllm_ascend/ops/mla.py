@@ -83,6 +83,9 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size
+        self.output_size = getattr(
+            mla_modules.o_proj, "output_size", num_heads * v_head_dim
+        )
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.q_lora_rank = q_lora_rank
@@ -159,7 +162,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         kv_cache: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        hidden_dim = self.hidden_size
+        hidden_dim = self.output_size
 
         if _EXTRA_CTX.flash_comm_v1_enabled and self.tp_size > 1 and self.is_vl_first_layer:
             need_gather_q_kv = False
