@@ -16,8 +16,10 @@
 
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from vllm.config import get_current_vllm_config
+from vllm.model_executor.layers.fla.ops.kda import FusedRMSNormGated
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
@@ -197,3 +199,42 @@ class AscendRMSNormGated(RMSNormGated):
     def forward_oot(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
         return LayerNormFn.apply(x, self.weight, self.bias, z, self.eps, self.group_size, self.norm_before_gate, True)
+
+
+class AscendFusedRMSNormGated(FusedRMSNormGated):
+    def forward_oot(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        prenorm: bool = False,
+        residual_in_fp32: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = x.dtype
+        x_float = x.float()
+
+        residual_out = None
+        if residual is not None:
+            x_float = x_float + residual.float()
+            residual_dtype = torch.float32 if residual_in_fp32 else orig_dtype
+            residual_out = x_float.to(residual_dtype)
+        elif residual_in_fp32:
+            residual_out = x_float
+
+        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+        out = x_float * torch.rsqrt(variance + self.eps)
+        if self.weight is not None:
+            out = out * self.weight.float()
+
+        g_float = g.float()
+        if self.activation in ("swish", "silu"):
+            out = out * F.silu(g_float)
+        else:
+            out = out * torch.sigmoid(g_float)
+
+        out = out.to(orig_dtype)
+        if prenorm:
+            if residual_out is None:
+                residual_out = x
+            return out, residual_out
+        return out

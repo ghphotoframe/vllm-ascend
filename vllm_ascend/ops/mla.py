@@ -124,6 +124,10 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             kv_a_proj_with_mqa=mla_modules.kv_a_proj_with_mqa,
             kv_a_layernorm=mla_modules.kv_a_layernorm,
             o_proj=mla_modules.o_proj,
+            g_proj=getattr(mla_modules, "g_proj", None),
+            gated_attention_proj_granularity_type=getattr(
+                mla_modules, "gated_attention_proj_granularity_type", None
+            ),
             layer_name=f"{prefix}.attn",
         )
 

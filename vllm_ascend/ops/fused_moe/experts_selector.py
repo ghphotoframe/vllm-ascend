@@ -223,11 +223,15 @@ def _select_expert_use_group_topk(
     topk_weights = _native_grouped_topk(topk_weights, num_expert_group, topk_group)
     # TODO bfloat16 is not supported in torch.topk with ge graph.
     if e_score_correction_bias is not None:
-        topk_ids = torch.topk(topk_weights.to(torch.float32), k=top_k, dim=-1, sorted=False)[1]
+        topk_ids = torch.topk(
+            topk_weights.to(torch.float32), k=top_k, dim=-1, sorted=False
+        )[1]
         # Use original unbiased scores for the routing weights
         topk_weights = original_weights.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(topk_weights.to(torch.float32), k=top_k, dim=-1, sorted=False)
+        topk_weights, topk_ids = torch.topk(
+            topk_weights.to(torch.float32), k=top_k, dim=-1, sorted=False
+        )
     topk_ids = topk_ids.to(torch.int32)
     topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
     return topk_weights, topk_ids

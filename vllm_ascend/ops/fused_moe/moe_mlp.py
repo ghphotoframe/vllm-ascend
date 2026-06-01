@@ -349,6 +349,7 @@ def unquant_apply_mlp(
     w1_bias: torch.Tensor = None,
     w2_bias: torch.Tensor = None,
     activation: str | None = None,
+    activation_limit: float | None = None,
     group_list_type: int = 1,
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
@@ -372,6 +373,12 @@ def unquant_apply_mlp(
     if act_name == "swigluoai":
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
+    elif act_name == "swiglustep":
+        gate, up = gate_up_out.chunk(2, dim=-1)
+        limit = 7.0 if activation_limit is None else float(activation_limit)
+        gate_up_out = (gate * torch.sigmoid(gate)).clamp(max=limit) * up.clamp(
+            min=-limit, max=limit
+        )
     else:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
@@ -411,6 +418,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     w1_offset = mlp_compute_input.weights.w1_offset
     w2_offset = mlp_compute_input.weights.w2_offset
     activation = mlp_compute_input.activation
+    activation_limit = mlp_compute_input.activation_limit
     need_trans = mlp_compute_input.need_trans
     dynamic_eplb = mlp_compute_input.dynamic_eplb
     fusion = mlp_compute_input.fusion
@@ -424,6 +432,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             activation=activation,
+            activation_limit=activation_limit,
             group_list=group_list,
             group_list_type=group_list_type,
             topk_scales=topk_scales,

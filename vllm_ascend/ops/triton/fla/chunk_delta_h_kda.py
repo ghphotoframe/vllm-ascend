@@ -13,7 +13,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index_kda import prepare_chunk_indices, prepare_chunk_offsets
-from .op_kda import exp
+from .op_kda import exp, exp2
 from .utils_kda import FLA_CHUNK_SIZE, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
@@ -232,7 +232,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=(o_k1 < K),
                 other=0.0,
             )
-            b_h1 *= exp(b_gk_last1)[None, :]
+            b_h1 *= exp2(b_gk_last1)[None, :]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
@@ -240,7 +240,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k2 < K),
                     other=0.0,
                 )
-                b_h2 *= exp(b_gk_last2)[None, :]
+                b_h2 *= exp2(b_gk_last2)[None, :]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
@@ -248,7 +248,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k3 < K),
                     other=0.0,
                 )
-                b_h3 *= exp(b_gk_last3)[None, :]
+                b_h3 *= exp2(b_gk_last3)[None, :]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
@@ -256,7 +256,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     mask=(o_k4 < K),
                     other=0.0,
                 )
-                b_h4 *= exp(b_gk_last4)[None, :]
+                b_h4 *= exp2(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
         p_k = tl.make_block_ptr(
