@@ -734,7 +734,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.q_proj = kwargs["q_proj"] if self.q_lora_rank is None else kwargs["q_b_proj"]
         self.kv_b_proj = kwargs["kv_b_proj"]
         self.o_proj = kwargs["o_proj"]
-        	
+
         self.g_proj = kwargs.get("g_proj")
         self.gated_attention_proj_granularity_type = kwargs.get(
             "gated_attention_proj_granularity_type"

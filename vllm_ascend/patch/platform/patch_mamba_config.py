@@ -67,7 +67,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
         # mamba_pagesize_padded = 0 + nope + rope
 
         # Kda models (e.g. bailing3.0) have 3 CONV state and 1 SSM state
-        # mamba_shapes=((3, 1024), (3, 1024), (3, 1024), (8, 128, 128)) 
+        # mamba_shapes=((3, 1024), (3, 1024), (3, 1024), (8, 128, 128))
         #          |CONV*3   |SSM      |PADDING
         # MAMBA    |36864    |524288   |65536
         #          |PADDING  |NOPE     |ROPE
@@ -81,7 +81,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
         ).page_size_bytes
 
         conv_block_page_size = mamba_page_size - ssm_block_page_size
-
     else:
         attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         attn_head_size = model_config.get_head_size()

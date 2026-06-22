@@ -720,12 +720,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
     from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
     from vllm_ascend.ops.bailing_moe_v3_kda import AscendBailingMoeV3KimiDeltaAttention
-    from vllm_ascend.ops.layernorm import (
-        AscendFusedRMSNormGated,
-        AscendGemmaRMSNorm,
-        AscendRMSNorm,
-        AscendRMSNormGated,
-    )
+    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
         AscendColumnParallelLinear,
         AscendMergedColumnParallelLinear,
@@ -768,7 +763,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "LogitsProcessor": AscendLogitsProcessor,
         "RMSNorm": AscendRMSNorm,
         "GemmaRMSNorm": AscendGemmaRMSNorm,
-        "FusedRMSNormGated": AscendFusedRMSNormGated,
         "FusedMoE": AscendFusedMoE,
         "MultiHeadLatentAttentionWrapper": AscendMultiHeadLatentAttention,
         "MMEncoderAttention": AscendMMEncoderAttention,
