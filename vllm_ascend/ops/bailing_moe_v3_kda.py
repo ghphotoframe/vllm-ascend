@@ -26,7 +26,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from vllm_ascend.ops.triton.fla.kda import chunk_kda, fused_recurrent_kda
+from vllm_ascend.ops.triton.kda.kda import chunk_kda, fused_recurrent_kda
 
 
 class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
