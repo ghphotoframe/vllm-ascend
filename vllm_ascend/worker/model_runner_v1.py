@@ -52,7 +52,6 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -2930,7 +2929,7 @@ class NPUModelRunner(GPUModelRunner):
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
-                builder, (GDNAttentionMetadataBuilder, LinearAttentionMetadataBuilder)
+                builder, (GDNAttentionMetadataBuilder,)
             ):
                 assert ubid is None, "UBatching not supported with spec decode metadata yet"
                 extra_attn_metadata_args = dict(

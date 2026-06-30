@@ -49,7 +49,6 @@ from .methods import get_scheme_class
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
 BAILING_HYBRID_MODEL_TYPES = (
     "bailing_hybrid",
-    "bailing_hybrid_mtp",
     "bailing_hybrid_v3_mtp",
 )
 BAILING_MTP_SHARED_HEAD_PATTERN = re.compile(r"^model\.layers\.\d+\.shared_head\.head$")
