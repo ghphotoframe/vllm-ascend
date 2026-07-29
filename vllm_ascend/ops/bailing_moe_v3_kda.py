@@ -21,13 +21,12 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3KimiDeltaAttention
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
-from vllm_ascend.ops.triton.kda.kda import chunk_kda, fused_recurrent_kda
+from vllm_ascend.ops.triton.kda.kda import chunk_kda, fused_recurrent_kda, fused_recurrent_kda_fwd
 
 
 class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
@@ -59,12 +58,8 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         num_accepted_tokens = attn_metadata.num_accepted_tokens
         num_actual_tokens = attn_metadata.num_actual_tokens
-        conv_state, recurrent_state = self.kv_cache
-        conv_state_storage = conv_state
+        conv_state_storage, recurrent_state = self.kv_cache
         recurrent_state_active = recurrent_state[..., : self.head_dim]
-        if not is_conv_state_dim_first():
-            conv_state = conv_state.transpose(-1, -2)
-        conv_state_q, conv_state_k, conv_state_v = conv_state.chunk(3, dim=-2)
 
         q_proj_states = q_proj_states[:num_actual_tokens]
         k_proj_states = k_proj_states[:num_actual_tokens]
@@ -134,49 +129,59 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             assert q_proj_states_spec is not None
             assert k_proj_states_spec is not None
             assert v_proj_states_spec is not None
+
+            # Pack q/k/v and conv weights (same as prefill/decode path)
+            qkv_spec = torch.cat(
+                (q_proj_states_spec, k_proj_states_spec, v_proj_states_spec),
+                dim=-1,
+            )
+            conv_weights = torch.cat(
+                (q_conv_weights, k_conv_weights, v_conv_weights), dim=0
+            )
+            conv_weights = conv_weights.transpose(0, 1).to(dtype=qkv_spec.dtype).contiguous()
+
+            # Prepare conv_state from original packed cache (NOT chunk views)
+            conv_state_for_op = conv_state_storage
+            if is_conv_state_dim_first():
+                conv_state_for_op = conv_state_for_op.transpose(-1, -2).contiguous()
+            if conv_state_for_op.dtype != qkv_spec.dtype:
+                conv_state_for_op = conv_state_for_op.to(dtype=qkv_spec.dtype)
+
+            # Use top-level metadata fields directly (spec_decode_metadata
+            # is only attached by Ascend GDN builder, not available for KDA layers).
+            # spec_num_rows = spec_query_start_loc.size(0) - 1 handles both
+            # normal and FULL graph padding modes (same as nested metadata logic).
+            assert spec_query_start_loc is not None
             assert spec_state_indices is not None
-            q_spec = causal_conv1d_update(
-                q_proj_states_spec,
-                conv_state_q,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_state_indices=spec_state_indices[:, 0][
-                    : attn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices.size(-1),
-                validate_data=False,
+            assert num_accepted_tokens is not None
+            spec_num_rows = spec_query_start_loc.size(0) - 1
+
+            # Call C operator with run_mode=1 (spec decode mode)
+            qkv_out_spec = torch.empty_like(qkv_spec)
+            torch.ops._C_ascend.npu_causal_conv1d_custom(
+                qkv_out_spec,
+                qkv_spec,
+                conv_weights,
+                conv_state=conv_state_for_op,
+                bias_opt=None,
+                query_start_loc_opt=spec_query_start_loc,
+                cache_indices_opt=spec_state_indices[:spec_num_rows],
+                initial_state_mode_opt=None,
+                num_accepted_tokens_opt=num_accepted_tokens[:spec_num_rows],
+                activation_mode=1,
+                pad_slot_id=PAD_SLOT_ID,
+                run_mode=1,
             )
-            k_spec = causal_conv1d_update(
-                k_proj_states_spec,
-                conv_state_k,
-                k_conv_weights,
-                self.k_conv1d.bias,
-                activation="silu",
-                conv_state_indices=spec_state_indices[:, 0][
-                    : attn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices.size(-1),
-                validate_data=False,
-            )
-            v_spec = causal_conv1d_update(
-                v_proj_states_spec,
-                conv_state_v,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_state_indices=spec_state_indices[:, 0][
-                    : attn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices.size(-1),
-                validate_data=False,
-            )
+
+            # Write back conv_state if needed
+            if conv_state_for_op is not conv_state_storage:
+                if is_conv_state_dim_first():
+                    conv_state_for_op = conv_state_for_op.transpose(-1, -2)
+                conv_state_storage.copy_(
+                    conv_state_for_op.to(dtype=conv_state_storage.dtype)
+                )
+
+            q_spec, k_spec, v_spec = qkv_out_spec.chunk(3, dim=-1)
         else:
             q_spec = k_spec = v_spec = None
 
