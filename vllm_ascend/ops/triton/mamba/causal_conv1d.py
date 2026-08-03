@@ -544,6 +544,7 @@ def causal_conv1d_update_npu(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
+    weight_is_transposed: bool = False,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -554,7 +555,8 @@ def causal_conv1d_update_npu(
         the total tokens of all sequences in that batch
 
     conv_state: (..., dim, state_len), where state_len >= width - 1
-    weight: (dim, width)
+    weight: (dim, width), or (width, dim) if weight_is_transposed is True
+    weight_is_transposed: whether weight is already stored as (width, dim)
     bias: (dim,)
     conv_state_indices: (batch,), dtype int32
         If not None, the conv_state is a larger tensor along the batch dim,
@@ -583,7 +585,8 @@ def causal_conv1d_update_npu(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
     """
-    weight = weight.transpose(0, 1).contiguous()
+    if not weight_is_transposed:
+        weight = weight.transpose(0, 1).contiguous()
     conv_state = conv_state.transpose(1, 2).contiguous()
     if validate_data:
         assert pad_slot_id is not None

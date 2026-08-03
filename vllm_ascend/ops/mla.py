@@ -96,7 +96,14 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         self.enable_shared_expert_dp = get_ascend_config().enable_shared_expert_dp
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layers = hf_config.num_hidden_layers
-        self.skip_o_proj = not hasattr(mla_modules.o_proj, "weight")
+        custom_o_proj = getattr(mla_modules, "custom_o_proj", None)
+        self.handles_gate_o_proj = custom_o_proj is not None
+        effective_o_proj = (
+            custom_o_proj
+            if self.handles_gate_o_proj
+            else mla_modules.o_proj
+        )
+        self.skip_o_proj = not hasattr(effective_o_proj, "weight")
         if mla_modules.indexer is not None:
             ascend_indexer = IndexerWrapper(mla_modules.indexer)
         else:
@@ -125,7 +132,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             q_proj=mla_modules.q_proj,
             kv_a_proj_with_mqa=mla_modules.kv_a_proj_with_mqa,
             kv_a_layernorm=mla_modules.kv_a_layernorm,
-            o_proj=mla_modules.o_proj,
+            o_proj=effective_o_proj,
             g_proj=getattr(mla_modules, "g_proj", None),
             gated_attention_proj_granularity_type=getattr(
                 mla_modules, "gated_attention_proj_granularity_type", None

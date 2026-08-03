@@ -682,6 +682,7 @@ def _get_row_parallel_op(
             "out_proj",  # attn output linear of Qwen3 Next
             "down_proj",  # second MLP of most LLMs
             "attention.dense",  # attn output linear of Bailing
+            "self_attn.dense",  # attn output linear of Bailing V3 MLA
             "wo_b",  # attn output linear of v4
         ]
         for a_prefix in sp_row_prefixes:

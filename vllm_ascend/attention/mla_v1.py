@@ -1708,6 +1708,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         output_padded = output
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
         o_proj_input = torch.zeros(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        gate_hidden_states = hidden_states
 
         # MLA Preprocess
         if (self.fa_quant_layer or self.enable_mlapo) and (
@@ -1716,6 +1717,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            gate_hidden_states = hidden_states
             decode_preprocess_res, prefill_preprocess_res = DeviceOperator.mla_preprocess_only_decode(
                 self, hidden_states, kv_cache, attn_metadata
             )
@@ -1723,6 +1725,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
                 layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv
             )
+            if need_gather_q_kv and self.g_proj is not None:
+                gate_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                    hidden_states.contiguous(), True
+                )
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             output_decode = self._forward_decode(
@@ -1754,8 +1760,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
 
         if self.g_proj is not None:
-            gate = torch.sigmoid(self.g_proj(hidden_states)[0].float()).to(
-                hidden_states.dtype
+            gate = torch.sigmoid(self.g_proj(gate_hidden_states)[0].float()).to(
+                gate_hidden_states.dtype
             )
             if self.gated_attention_proj_granularity_type == "head_wise":
                 gated_input = o_proj_input.view(-1, self.num_heads, self.v_head_dim)
