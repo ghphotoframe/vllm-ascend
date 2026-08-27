@@ -32,11 +32,17 @@ from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.kda.kda import rms_norm_gated
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_npu
 
-if os.environ.get("ENABLE_PYPTO") == "1":
+if os.environ.get("ENABLE_PYPTO_KDA") == "1":
     from vllm_ascend.ops.pypto.kda.chunk_kda_impl import chunk_kda_wrapper as chunk_kda
     from vllm_ascend.ops.pypto.kda.fused_recurrent_kda_impl import fused_recurrent_kda
-else:
+elif os.environ.get("ENABLE_TRITON_KDA") == "1":
     from vllm_ascend.ops.triton.kda.kda import chunk_kda, fused_recurrent_kda
+elif os.environ.get("ENABLE_PYPTO_P_ASCEND_D") == "1":
+    from vllm_ascend.ops.pypto.kda.chunk_kda_impl import chunk_kda_wrapper as chunk_kda
+    from vllm_ascend.ops.ascendc_kda import recurrent_kda as fused_recurrent_kda
+else:
+    from vllm_ascend.ops.triton.kda.kda import chunk_kda
+    from vllm_ascend.ops.ascendc_kda import recurrent_kda as fused_recurrent_kda
 
 
 def _to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
@@ -44,6 +50,20 @@ def _to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     if tensor.dim() == 0:
         return (tensor.item(),)
     return tuple(tensor.tolist())
+
+
+def _zero_padded_spec_output(
+    output: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> torch.Tensor:
+    """Clear graph-padding rows skipped by recurrent KDA."""
+    token_indices = torch.arange(
+        output.shape[1],
+        dtype=query_start_loc.dtype,
+        device=output.device,
+    )
+    valid_tokens = token_indices < query_start_loc[-1]
+    return torch.where(valid_tokens.view(1, -1, 1, 1), output, 0.0)
 
 
 def _require_non_spec_prefill_fallback_meta(attn_metadata, field_name: str):
@@ -159,12 +179,8 @@ class AscendBailingMoeV3FusedRMSNormGated(FusedRMSNormGated):
         prenorm: bool = False,
         residual_in_fp32: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None and (
-            residual_in_fp32 or residual.dtype != x.dtype
-        ):
-            return self._forward_decomposed(
-                x, g, residual, prenorm, residual_in_fp32
-            )
+        if residual is not None and (residual_in_fp32 or residual.dtype != x.dtype):
+            return self._forward_decomposed(x, g, residual, prenorm, residual_in_fp32)
         return rms_norm_gated(
             x,
             g,
@@ -179,7 +195,6 @@ class AscendBailingMoeV3FusedRMSNormGated(FusedRMSNormGated):
 
 
 class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
@@ -205,9 +220,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
     def _conv1d_weight_2d(conv1d: nn.Module) -> torch.Tensor:
         return conv1d.weight.view(conv1d.weight.size(0), conv1d.weight.size(2))
 
-    def _get_conv1d_update_weight(
-        self, cache_name: str, conv1d: nn.Module
-    ) -> torch.Tensor:
+    def _get_conv1d_update_weight(self, cache_name: str, conv1d: nn.Module) -> torch.Tensor:
         weight = self._conv1d_weight_2d(conv1d)
         cached_weight = getattr(self, cache_name)
         if (
@@ -226,9 +239,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-            hidden_states, True
-        )
+        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True)
         super().forward(hidden_states, positions, output)
 
     def _forward(
@@ -270,24 +281,12 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        q_conv_weights = self.q_conv1d.weight.view(
-            self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
-        )
-        k_conv_weights = self.k_conv1d.weight.view(
-            self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2)
-        )
-        v_conv_weights = self.v_conv1d.weight.view(
-            self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
-        )
-        q_conv_update_weight = self._get_conv1d_update_weight(
-            "_q_conv1d_update_weight", self.q_conv1d
-        )
-        k_conv_update_weight = self._get_conv1d_update_weight(
-            "_k_conv1d_update_weight", self.k_conv1d
-        )
-        v_conv_update_weight = self._get_conv1d_update_weight(
-            "_v_conv1d_update_weight", self.v_conv1d
-        )
+        q_conv_weights = self.q_conv1d.weight.view(self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2))
+        k_conv_weights = self.k_conv1d.weight.view(self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2))
+        v_conv_weights = self.v_conv1d.weight.view(self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2))
+        q_conv_update_weight = self._get_conv1d_update_weight("_q_conv1d_update_weight", self.q_conv1d)
+        k_conv_update_weight = self._get_conv1d_update_weight("_k_conv1d_update_weight", self.k_conv1d)
+        v_conv_update_weight = self._get_conv1d_update_weight("_v_conv1d_update_weight", self.v_conv1d)
 
         if spec_sequence_masks is not None:
             assert spec_query_start_loc is not None
@@ -312,15 +311,9 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 v_proj_states_spec = v_proj_states.index_select(0, spec_token_indx)
                 g1_spec = g1.index_select(1, spec_token_indx)
                 beta_spec = beta.index_select(1, spec_token_indx)
-                q_proj_states_non_spec = q_proj_states.index_select(
-                    0, non_spec_token_indx
-                )
-                k_proj_states_non_spec = k_proj_states.index_select(
-                    0, non_spec_token_indx
-                )
-                v_proj_states_non_spec = v_proj_states.index_select(
-                    0, non_spec_token_indx
-                )
+                q_proj_states_non_spec = q_proj_states.index_select(0, non_spec_token_indx)
+                k_proj_states_non_spec = k_proj_states.index_select(0, non_spec_token_indx)
+                v_proj_states_non_spec = v_proj_states.index_select(0, non_spec_token_indx)
                 g1_non_spec = g1.index_select(1, non_spec_token_indx)
                 beta_non_spec = beta.index_select(1, non_spec_token_indx)
         else:
@@ -350,9 +343,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 weight,
                 bias,
                 activation="silu",
-                conv_state_indices=spec_state_indices[:, 0][
-                    : attn_metadata.num_spec_decodes
-                ],
+                conv_state_indices=spec_state_indices[:, 0][: attn_metadata.num_spec_decodes],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices.size(-1),
@@ -391,9 +382,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             assert q_proj_states_non_spec is not None
             assert k_proj_states_non_spec is not None
             assert v_proj_states_non_spec is not None
-            causal_conv1d_host_args = _get_non_spec_causal_conv1d_host_args(
-                attn_metadata
-            )
+            causal_conv1d_host_args = _get_non_spec_causal_conv1d_host_args(attn_metadata)
             q = _causal_conv1d_prefill(
                 q_proj_states_non_spec,
                 q_conv_weights,
@@ -476,6 +465,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             assert spec_query_start_loc is not None
             assert spec_state_indices is not None
             assert num_accepted_tokens is not None
+            spec_query_start_loc_active = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
             out_spec, _ = fused_recurrent_kda(
                 q=q_spec,
                 k=k_spec,
@@ -486,12 +476,11 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 use_qk_l2norm_in_kernel=True,
                 safe_gate=self.safe_gate,
                 lower_bound=self.lower_bound,
-                cu_seqlens=spec_query_start_loc[
-                    : attn_metadata.num_spec_decodes + 1
-                ],
-                ssm_state_indices=spec_state_indices,
-                num_accepted_tokens=num_accepted_tokens,
+                cu_seqlens=spec_query_start_loc_active,
+                ssm_state_indices=spec_state_indices[: attn_metadata.num_spec_decodes],
+                num_accepted_tokens=num_accepted_tokens[: attn_metadata.num_spec_decodes],
             )
+            out_spec = _zero_padded_spec_output(out_spec, spec_query_start_loc_active)
         else:
             out_spec = None
 
@@ -537,9 +526,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 use_qk_l2norm_in_kernel=True,
                 safe_gate=self.safe_gate,
                 lower_bound=self.lower_bound,
-                cu_seqlens=non_spec_query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ],
+                cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
                 ssm_state_indices=non_spec_state_indices,
             )
         else:
