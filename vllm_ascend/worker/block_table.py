@@ -3,10 +3,17 @@ import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
+from vllm.v1.worker.block_table import (
+    _compute_slot_mapping_kernel as _generic_compute_slot_mapping_kernel,
+)
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+
+from vllm_ascend.ops.triton.compute_slot_mapping import (
+    _compute_slot_mapping_kernel as _npu_compute_slot_mapping_kernel,
+    _next_power_of_2,
+)
 
 
 class BlockTable:
@@ -37,6 +44,13 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
         self.physical_block_size = block_size
+        # Mamba/KDA layers do not consume slot_mapping; they use
+        # block_table_tensor directly for state indices (gdn_attn.py).
+        # Skip slot_mapping computation for these groups to avoid
+        # unnecessary triton kernel launches.
+        self.is_mamba = isinstance(
+            kv_cache_group.kv_cache_spec, MambaSpec
+        ) if kv_cache_group is not None else False
 
         try:
             self.pcp_world_size = get_pcp_group().world_size
@@ -144,21 +158,49 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        _compute_slot_mapping_kernel[(num_reqs + 1,)](
-            num_tokens,
-            self.max_num_batched_tokens,
-            query_start_loc,
-            positions,
-            self.block_table.gpu,
-            self.block_table.gpu.stride(0),
-            self.block_size,
-            self.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
-            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
-            PAD_ID=PAD_SLOT_ID,
-            BLOCK_SIZE=1024,
-        )
+        if total_cp_world_size == 1:
+            # NPU-optimized kernel (from PR #13048): casts positions to int32
+            # immediately, uses mul+sub instead of modulo, and fixes
+            # non-contiguous block-table loads via a windowed gather.
+            TILE_BLOCK_SIZE = 1024
+            _npu_compute_slot_mapping_kernel[(num_reqs + 1,)](
+                num_tokens,
+                self.max_num_batched_tokens,
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                self.block_size,
+                self.slot_mapping.gpu,
+                KV_CACHE_BLOCK_SIZE=self.physical_block_size,
+                BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                TILE_BLOCK_SIZE=TILE_BLOCK_SIZE,
+                BLOCK_TABLE_WINDOW_SIZE=_next_power_of_2(
+                    cdiv(TILE_BLOCK_SIZE, self.block_size) + 1
+                ),
+            )
+        else:
+            # CP>1: keep old generic kernel as fallback until the NPU
+            # kernel CP path is validated with PCP/DCP integration tests.
+            _generic_compute_slot_mapping_kernel[(num_reqs + 1,)](
+                num_tokens,
+                self.max_num_batched_tokens,
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                self.block_size,
+                self.slot_mapping.gpu,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -375,6 +417,8 @@ class MultiGroupBlockTable:
         req_indices_compressed_list: list[np.ndarray] | None = None,
     ) -> None:
         for i, block_table in enumerate(self.block_tables):
+            if block_table.is_mamba:
+                continue
             if positions_compressed_list and req_indices_compressed_list:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:
@@ -388,6 +432,8 @@ class MultiGroupBlockTable:
         req_indices_compressed_list: list[np.ndarray] | None = None,
     ) -> None:
         for i, block_table in enumerate(self.block_tables):
+            if block_table.is_mamba:
+                continue
             if positions_compressed_list and req_indices_compressed_list:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:

@@ -2995,6 +2995,15 @@ class NPUModelRunner(GPUModelRunner):
         decode_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
+        # Prepare GDN query_start_loc once for all GDN groups (they share the
+        # same request layout). Calling _set_gdn_query_start_loc inside the
+        # inner loop would repeat the identical numpy write + H2D copy for
+        # every KDA/GDN group.
+        self._set_gdn_query_start_loc(
+            self.query_start_loc.np[1 : num_reqs + 1],
+            num_reqs,
+            num_reqs_padded,
+        )
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -3021,14 +3030,8 @@ class NPUModelRunner(GPUModelRunner):
                 cm_for_attn_group = cm
                 builder = self.attn_groups[kv_cache_gid][attn_gid].get_metadata_builder(0)
                 if isinstance(builder, GDNAttentionMetadataBuilder):
-                    # query_start_loc may be padded for FULL graph/FIA, but
-                    # GDN uses request query lengths to split spec/non-spec
-                    # tokens. Keep padded requests as zero-length dummy rows.
-                    self._set_gdn_query_start_loc(
-                        self.query_start_loc.np[1 : num_reqs + 1],
-                        num_reqs,
-                        num_reqs_padded,
-                    )
+                    # query_start_loc was already prepared before the loop;
+                    # just reference the shared buffer here.
                     cm_for_attn_group = copy(cm)
                     cm_for_attn_group.query_start_loc_cpu = (
                         self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
