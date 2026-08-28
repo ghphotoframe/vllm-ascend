@@ -2995,15 +2995,11 @@ class NPUModelRunner(GPUModelRunner):
         decode_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
-        # Prepare GDN query_start_loc once for all GDN groups (they share the
-        # same request layout). Calling _set_gdn_query_start_loc inside the
-        # inner loop would repeat the identical numpy write + H2D copy for
-        # every KDA/GDN group.
-        self._set_gdn_query_start_loc(
-            self.query_start_loc.np[1 : num_reqs + 1],
-            num_reqs,
-            num_reqs_padded,
-        )
+        # GDN query_start_loc is identical across all GDN groups (same request
+        # layout). Use a lazy flag so that _set_gdn_query_start_loc is called
+        # at most once on the first GDNAttentionMetadataBuilder encountered,
+        # avoiding redundant numpy writes + H2D copies for every KDA/GDN group.
+        gdn_query_start_loc_prepared = False
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -3030,8 +3026,13 @@ class NPUModelRunner(GPUModelRunner):
                 cm_for_attn_group = cm
                 builder = self.attn_groups[kv_cache_gid][attn_gid].get_metadata_builder(0)
                 if isinstance(builder, GDNAttentionMetadataBuilder):
-                    # query_start_loc was already prepared before the loop;
-                    # just reference the shared buffer here.
+                    if not gdn_query_start_loc_prepared:
+                        self._set_gdn_query_start_loc(
+                            self.query_start_loc.np[1 : num_reqs + 1],
+                            num_reqs,
+                            num_reqs_padded,
+                        )
+                        gdn_query_start_loc_prepared = True
                     cm_for_attn_group = copy(cm)
                     cm_for_attn_group.query_start_loc_cpu = (
                         self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
