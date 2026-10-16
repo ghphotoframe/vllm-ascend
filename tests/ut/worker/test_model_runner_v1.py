@@ -38,7 +38,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_v_scale_cache_shape,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
-from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAImpl
+from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAImpl, AscendMLAMetadataBuilder
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim, get_tq_fused_slot_bytes
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -1309,7 +1309,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         num_blocks = 2
         spec = AscendMLAAttentionSpec(
             block_size=384,
-            num_heads=64,
+            num_query_heads=64,
             num_kv_heads=1,
             head_size=576,
             dtype=torch.bfloat16,
@@ -1347,7 +1347,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         ):
             for q_heads in (8, 12, 64, 96):
                 with self.subTest(q_heads=q_heads):
-                    spec = replace(spec, num_heads=q_heads)
+                    spec = replace(spec, num_query_heads=q_heads)
                     with patch(
                         "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
                         return_value=flash_profile,
@@ -1360,7 +1360,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         # A5 FlashMLA does not support arbitrary query-head counts. Keep these
         # models on the FIA-compatible component-major layout.
-        spec = replace(spec, num_heads=48)
+        spec = replace(spec, num_query_heads=48)
         with patch(
             "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
             return_value=flash_profile,
@@ -1371,7 +1371,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         # A5 also falls back to FIA when the active CANN package does not
         # provide both FlashMLA APIs.
-        spec = replace(spec, num_heads=64)
+        spec = replace(spec, num_query_heads=64)
         with (
             patch(
                 "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
@@ -1386,7 +1386,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         # MooncakeV2 transfers raw physical slots without layout metadata, so
         # every PD endpoint uses the common component-major wire layout even
         # when local FlashMLA support would otherwise select token-fused.
-        spec = replace(spec, num_heads=64)
+        spec = replace(spec, num_query_heads=64)
         runner.vllm_config.kv_transfer_config = SimpleNamespace(
             kv_connector="MooncakeConnectorV2",
             kv_connector_module_path=None,
@@ -1447,7 +1447,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         layer_name = "model.layers.0.self_attn.attn"
         spec = AscendMLAAttentionSpec(
             block_size=384,
-            num_heads=64,
+            num_query_heads=64,
             num_kv_heads=1,
             head_size=576,
             dtype=torch.bfloat16,
@@ -2050,6 +2050,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             num_kv_heads=1,
             head_size=576,
             dtype=torch.bfloat16,
+            num_head_slots=2,
+            state_content_bytes=576,
         )
         attn_module = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(attn_module)
@@ -2065,7 +2067,10 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertIsInstance(spec, AscendMLAAttentionSpec)
         self.assertEqual(spec.model_version, attn_module.model_version)
         self.assertTrue(spec.indexes_kv_by_block_stride)
-        self.assertEqual(spec.num_heads, 64)
+        self.assertEqual(spec.num_heads, 2)
+        self.assertEqual(spec.num_query_heads, 64)
+        self.assertEqual(spec.num_head_slots, source_spec.num_head_slots)
+        self.assertEqual(spec.state_content_bytes, source_spec.state_content_bytes)
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
@@ -2223,6 +2228,83 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             {tuple(group.layer_names) for group in runner.attn_groups[0]},
             {(target_layer,), (draft_layer,), (cache_layer,)},
         )
+
+    @patch("vllm_ascend.attention.mla_v1.enable_dcp", return_value=False)
+    @patch(
+        "vllm.model_executor.layers.attention.mla_attention.get_dcp_group",
+        return_value=SimpleNamespace(world_size=1),
+    )
+    def test_mla_query_heads_split_metadata_builders_with_identical_kv_layout(self, _mock_dcp, _mock_enable_dcp):
+        # Only query heads differ: neither the cache shape nor RoPE can split
+        # these groups. Exercise real builder initialization, including Q heads.
+        for other_query_heads in (8, 48):
+            with self.subTest(other_query_heads=other_query_heads):
+                runner = self._build_runner()
+                runner._check_and_update_cudagraph_mode = MagicMock()
+                runner.calculate_reorder_batch_threshold = MagicMock()
+                layers = {}
+                specs = {}
+                for index, query_heads in enumerate((4, other_query_heads, 4)):
+                    name = f"model.layers.{index}.self_attn.attn"
+                    layer = MLAAttention.__new__(MLAAttention)
+                    torch.nn.Module.__init__(layer)
+                    layer.num_heads = query_heads
+                    layer.impl = SimpleNamespace(num_heads=query_heads, use_mla_rope=True)
+                    layer.attn_backend = AscendMLABackend
+                    layer.q_lora_rank = None
+                    layer.kv_lora_rank = 128
+                    layer.qk_nope_head_dim = 64
+                    layer.qk_rope_head_dim = 64
+                    layer.v_head_dim = 64
+                    layer.prefill_backend = MagicMock()
+                    layers[name] = layer
+                    specs[name] = AscendMLAAttentionSpec(
+                        block_size=128,
+                        num_query_heads=query_heads,
+                        num_kv_heads=1,
+                        head_size=192,
+                        dtype=torch.bfloat16,
+                    )
+                runner.vllm_config = SimpleNamespace(
+                    model_config=SimpleNamespace(
+                        dtype=torch.bfloat16,
+                        max_model_len=128,
+                        hf_text_config=SimpleNamespace(qk_rope_head_dim=64),
+                    ),
+                    cache_config=SimpleNamespace(block_size=128, cache_dtype="auto"),
+                    scheduler_config=SimpleNamespace(max_num_seqs=1, enable_chunked_prefill=False),
+                    parallel_config=SimpleNamespace(
+                        prefill_context_parallel_size=1,
+                        decode_context_parallel_size=1,
+                        cp_kv_cache_interleave_size=1,
+                    ),
+                    compilation_config=SimpleNamespace(static_forward_context=layers),
+                    attention_config=SimpleNamespace(use_prefill_query_quantization=False),
+                    speculative_config=None,
+                )
+                group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+                self.assertIsNotNone(group_spec)
+                assert group_spec is not None
+                config = KVCacheConfig(
+                    num_blocks=2,
+                    kv_cache_tensors=[],
+                    kv_cache_groups=[KVCacheGroupSpec(layer_names=list(layers), kv_cache_spec=group_spec)],
+                )
+
+                runner.initialize_attn_backend(config)
+
+                groups = runner.attn_groups[0]
+                self.assertEqual(len(groups), 2)
+                self.assertEqual(groups[0].layer_names, [list(layers)[0], list(layers)[2]])
+                self.assertEqual(groups[1].layer_names, [list(layers)[1]])
+                self.assertIsNot(groups[0].get_metadata_builder(), groups[1].get_metadata_builder())
+                for group, query_heads in zip(groups, (4, other_query_heads)):
+                    builder = group.get_metadata_builder()
+                    self.assertIsInstance(builder, AscendMLAMetadataBuilder)
+                    self.assertEqual(builder.num_heads, query_heads)
+                    self.assertEqual(builder.kv_cache_spec.num_query_heads, query_heads)
+                    self.assertEqual(builder.kv_cache_spec.num_heads, 1)
+                    self.assertTrue(builder.use_mla_rope)
 
     def test_cp_or_sp_decode_dispatch_keys_are_actually_captured(self):
         cases = (
@@ -2758,6 +2840,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(set(specs), {layer_name})
         spec = specs[layer_name]
         self.assertEqual(spec.head_size, 512 + 64)
+        self.assertEqual(spec.num_heads, 1)
+        self.assertEqual(spec.num_query_heads, attn_module.num_heads)
         self.assertFalse(hasattr(spec, "separate_sfa_indexer_cache"))
 
         kv_cache_config = KVCacheConfig(
@@ -2804,6 +2888,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         attn_module = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(attn_module)
+        attn_module.num_heads = 64
         attn_module.impl = SimpleNamespace(
             has_indexer=False,
             enable_sparse_sfa_c8=False,
@@ -2821,6 +2906,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertFalse(spec.cache_sparse_sfa_c8)
         self.assertEqual(spec.head_size, get_tq_fused_slot_bytes(512, 64))
         self.assertEqual(spec.dtype, torch.int8)
+        self.assertEqual(spec.num_heads, 1)
+        self.assertEqual(spec.num_query_heads, attn_module.num_heads)
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
@@ -2846,6 +2933,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         attn_module = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(attn_module)
+        attn_module.num_heads = 64
         attn_module.impl = SimpleNamespace(
             has_indexer=False,
             enable_sparse_sfa_c8=False,
@@ -3266,6 +3354,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                     torch.float8_e4m3fn if enable_sfa_c8 else torch.bfloat16,
                 )
                 self.assertEqual(main_spec.cache_sparse_sfa_c8, enable_sfa_c8)
+                self.assertEqual(main_spec.num_heads, 1)
+                self.assertEqual(main_spec.num_query_heads, attn_module.num_heads)
                 self.assertEqual(
                     indexer_spec.dtype,
                     torch.float8_e4m3fn if enable_li_c8 else torch.bfloat16,
@@ -3311,6 +3401,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         attn_module = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(attn_module)
+        attn_module.num_heads = 64
         attn_module.kv_lora_rank = 512
         attn_module.qk_rope_head_dim = 64
         indexer_module = DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache)

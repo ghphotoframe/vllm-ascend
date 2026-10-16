@@ -42,7 +42,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAMetadataBuilder,
     AscendDSASWABackend,
 )
-from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadataBuilder
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
@@ -501,7 +501,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
     num_blocks = 2
     spec = AscendMLAAttentionSpec(
         block_size=384,
-        num_heads=64,
+        num_query_heads=64,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
@@ -581,7 +581,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
     monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: flash_profile)
     monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: (MagicMock(), MagicMock()))
     for q_heads in (8, 12, 64, 96):
-        spec = replace(spec, num_heads=q_heads)
+        spec = replace(spec, num_query_heads=q_heads)
         fused = reshape()
         assert isinstance(fused, torch.Tensor)
         assert fused.shape == (6, 128, 1, 576)
@@ -589,14 +589,14 @@ def test_v2_mla_single_raw_backing_selects_layout_by_hardware_and_local_q_heads(
 
     # Even on A5, FlashMLA-incompatible query-head counts use the
     # FIA-compatible component-major layout.
-    spec = replace(spec, num_heads=48)
+    spec = replace(spec, num_query_heads=48)
     a5_fallback = reshape()
     assert isinstance(a5_fallback, tuple)
 
     # Missing FlashMLA APIs in the active CANN package also select the
     # FIA-compatible component-major layout.
     monkeypatch.setattr(attn_utils, "get_flashmla_ops", lambda: None)
-    spec = replace(spec, num_heads=64)
+    spec = replace(spec, num_query_heads=64)
     missing_flashmla_ops = reshape()
     assert isinstance(missing_flashmla_ops, tuple)
 
@@ -1113,16 +1113,16 @@ def test_gqa_pcp_dcp_cache_keeps_tp_local_kv_heads(monkeypatch, dcp_size):
     assert specs["model.layers.0.self_attn.attn"].num_kv_heads == 1
 
 
-@pytest.mark.parametrize(
-    ("model_type", "expected_num_heads"),
-    [("kimi_linear", 1), ("deepseek_v3", 12)],
-)
-def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type, expected_num_heads):
+@pytest.mark.parametrize("model_type", ["kimi_linear", "deepseek_v3", "bailing_hybrid", "bailing_hybrid_v3_mtp"])
+@pytest.mark.parametrize("num_head_slots", [None, 2])
+def test_mla_cache_spec_separates_physical_and_query_heads(monkeypatch, model_type, num_head_slots):
     source_spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
+        num_head_slots=num_head_slots,
+        state_content_bytes=576 if num_head_slots == 2 else None,
     )
     layer = MLAAttention.__new__(MLAAttention)
     layer.impl = SimpleNamespace(
@@ -1157,7 +1157,10 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type,
     spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
 
     assert isinstance(spec, AscendMLAAttentionSpec)
-    assert spec.num_heads == expected_num_heads
+    assert spec.num_heads == source_spec.num_heads
+    assert spec.num_query_heads == layer.num_heads
+    assert spec.num_head_slots == source_spec.num_head_slots
+    assert spec.state_content_bytes == source_spec.state_content_bytes
     assert spec.page_size_bytes == source_spec.page_size_bytes
 
 
@@ -2218,10 +2221,11 @@ def _make_mla_layer(*, fa_quant: bool = False, sparse_c8: bool = False):
     )
     layer.get_kv_cache_spec = lambda _cfg: SimpleNamespace(
         block_size=16,
-        # vLLM's generic MLA spec exposes cache head slots here, not local
-        # query heads. The Ascend spec must deliberately use the module count.
+        # Preserve physical cache geometry; num_query_heads comes from the layer.
         num_heads=1,
         num_kv_heads=1,
+        num_head_slots=None,
+        state_content_bytes=None,
         head_size=128,
         dtype=torch.bfloat16,
         cache_dtype_str="auto",
@@ -2230,6 +2234,81 @@ def _make_mla_layer(*, fa_quant: bool = False, sparse_c8: bool = False):
         tokens_per_state=1,
     )
     return layer
+
+
+@pytest.mark.parametrize("other_query_heads", [8, 48])
+def test_v2_mla_query_heads_split_metadata_builders_with_identical_kv_layout(monkeypatch, other_query_heads):
+    # Run the upstream initializer used by the Ascend V2 adapter, including its
+    # kernel-block-size spec copy and real Ascend metadata builder construction.
+    layers = {}
+    specs = {}
+    for index, query_heads in enumerate((4, other_query_heads, 4)):
+        name = f"model.layers.{index}.self_attn.attn"
+        layer = _make_mla_layer()
+        layer.num_heads = query_heads
+        layer.impl.num_heads = query_heads
+        layer.impl.use_mla_rope = True
+        layer.attn_backend = AscendMLABackend
+        layer.q_lora_rank = None
+        layer.qk_nope_head_dim = 64
+        layer.v_head_dim = 64
+        layer.prefill_backend = MagicMock()
+        layers[name] = layer
+        specs[name] = AscendMLAAttentionSpec(
+            block_size=256,
+            num_query_heads=query_heads,
+            num_kv_heads=1,
+            head_size=192,
+            dtype=torch.bfloat16,
+        )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            max_model_len=256,
+            hf_text_config=SimpleNamespace(qk_rope_head_dim=64),
+        ),
+        cache_config=SimpleNamespace(block_size=256, cache_dtype="auto", kv_sharing_fast_prefill=False),
+        scheduler_config=SimpleNamespace(max_num_seqs=1, enable_chunked_prefill=False),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+            use_ubatching=False,
+        ),
+        compilation_config=SimpleNamespace(static_forward_context=layers),
+        attention_config=SimpleNamespace(use_prefill_query_quantization=False),
+        speculative_config=None,
+    )
+    group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+    assert group_spec is not None
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=list(layers), kv_cache_spec=group_spec)],
+    )
+    monkeypatch.setattr("vllm_ascend.attention.mla_v1.enable_dcp", lambda: False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.mla_attention.get_dcp_group", lambda: SimpleNamespace(world_size=1)
+    )
+
+    attn_groups, _, kernel_block_sizes = upstream_attn_utils.init_attn_backend(config, vllm_config, torch.device("cpu"))
+
+    assert kernel_block_sizes == [128]
+    assert len(attn_groups) == 1
+    groups = attn_groups[0]
+    assert len(groups) == 2
+    assert groups[0].layer_names == [list(layers)[0], list(layers)[2]]
+    assert groups[1].layer_names == [list(layers)[1]]
+    assert groups[0].get_metadata_builder() is not groups[1].get_metadata_builder()
+    for group, query_heads in zip(groups, (4, other_query_heads)):
+        builder = group.get_metadata_builder()
+        assert isinstance(builder, AscendMLAMetadataBuilder)
+        assert builder.num_heads == query_heads
+        assert builder.kv_cache_spec.num_query_heads == query_heads
+        assert builder.kv_cache_spec.num_heads == 1
+        assert builder.kv_cache_spec.block_size == 128
+        assert group.kv_cache_spec.block_size == 256
+        assert builder.use_mla_rope
 
 
 def test_v2_sparse_offload_marks_main_mla_cache_host_resident(monkeypatch):
@@ -2491,8 +2570,10 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
     specs = attn_utils.get_kv_cache_spec(vllm_config)
     assert set(specs) == {"fa", "sfa"}
     assert specs["fa"].head_size == 128
-    assert specs["fa"].num_heads == 64
-    assert specs["sfa"].num_heads == 64
+    assert specs["fa"].num_heads == 1
+    assert specs["sfa"].num_heads == 1
+    assert specs["fa"].num_query_heads == 64
+    assert specs["sfa"].num_query_heads == 64
     assert specs["sfa"].cache_sparse_sfa_c8 is True
 
     mla_spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)

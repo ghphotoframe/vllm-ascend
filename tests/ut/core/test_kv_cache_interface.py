@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
+from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups, is_kv_cache_spec_uniform
 from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+    create_kv_cache_views,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -50,6 +57,108 @@ def test_matching_ascend_mla_specs_merge():
     spec = _mla_spec()
     assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
     assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
+
+
+@pytest.mark.parametrize("num_query_heads", [None, 4, 8, 12, 48, 64, 96])
+def test_mla_merge_preserves_query_head_metadata(num_query_heads):
+    spec = replace(_mla_spec(), num_query_heads=num_query_heads)
+    merged = AscendMLAAttentionSpec.merge([spec, spec])
+    assert merged.num_heads == 1
+    assert merged.num_query_heads == num_query_heads
+    assert merged == spec
+
+
+def test_mla_merge_rejects_different_query_head_layouts():
+    spec = replace(_mla_spec(), num_query_heads=8)
+    other = replace(spec, num_query_heads=4)
+    assert spec != other
+    assert not is_kv_cache_spec_uniform({"layer0": spec, "layer1": other})
+    with pytest.raises(AssertionError, match="same Ascend KV cache layout"):
+        AscendMLAAttentionSpec.merge([spec, other])
+
+
+@pytest.mark.parametrize("num_query_heads", [4, 8, 12, 48, 64, 96])
+@pytest.mark.parametrize("block_size", [384, 640])
+@pytest.mark.parametrize("num_head_slots", [None, 2])
+def test_mla_query_heads_do_not_inflate_planner_page_strides(num_query_heads, block_size, num_head_slots):
+    """The real planner and its CPU views must address the same physical pages."""
+    nope_head_size, rope_head_size = 512, 64
+    head_size = nope_head_size + rope_head_size
+    dtype = torch.bfloat16
+    element_size = torch.empty((), dtype=dtype).element_size()
+    physical_heads = num_head_slots if num_head_slots is not None else 1
+    # A backend can pack one latent vector into two physical head slots. Each
+    # then holds half the content; the total bytes per token stay unchanged.
+    state_content_bytes = head_size * element_size // physical_heads
+    spec = AscendMLAAttentionSpec(
+        block_size=block_size,
+        num_query_heads=num_query_heads,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=dtype,
+        num_head_slots=num_head_slots,
+        state_content_bytes=state_content_bytes if num_head_slots is not None else None,
+    )
+    merged = AscendMLAAttentionSpec.merge([spec, spec])
+    assert merged == spec
+    assert merged.num_heads == physical_heads
+    assert merged.num_query_heads == num_query_heads
+    assert merged.num_head_slots == num_head_slots
+    assert merged.state_content_bytes == spec.state_content_bytes
+
+    num_blocks = 12
+    page_bytes = block_size * head_size * element_size
+    layer_names = ["model.layers.0.attn", "model.layers.1.attn"]
+    groups = [KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=merged)]
+    layout = KVCacheLayout.LBNHC
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: layout,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+        ),
+        kv_transfer_config=None,
+        speculative_config=None,
+    )
+    planned = get_kv_cache_config_from_groups(config, groups, num_blocks * len(layer_names) * page_bytes)
+
+    assert merged.page_size_bytes == page_bytes
+    assert planned.num_blocks == num_blocks
+    assert len(planned.kv_cache_tensors) == 1
+    descriptor = planned.kv_cache_tensors[0]
+    assert descriptor.layers == layer_names
+    assert descriptor.block_stride == page_bytes
+    assert descriptor.layer_stride == num_blocks * page_bytes
+    assert descriptor.size == num_blocks * len(layer_names) * page_bytes
+    assert descriptor.offset == 0
+
+    raw = torch.zeros(descriptor.size, dtype=torch.int8)
+    views = create_kv_cache_views(raw, merged, planned.num_blocks, layout, descriptor)
+    content_elements = state_content_bytes // element_size
+    raw_pages = raw.view(dtype).view(len(layer_names), num_blocks, block_size, physical_heads, content_elements)
+    assert len(views) == len(layer_names)
+    for layer_idx, view in enumerate(views):
+        assert view.shape == (num_blocks, physical_heads, block_size, content_elements)
+        assert view.stride(0) * element_size == page_bytes
+        assert view.stride(1) * element_size == state_content_bytes
+        assert view.stride(2) * element_size == head_size * element_size
+        for block_idx in range(num_blocks):
+            page_offset = layer_idx * num_blocks * page_bytes + block_idx * page_bytes
+            assert view[block_idx].data_ptr() == raw.data_ptr() + page_offset
+            for head_idx in range(physical_heads):
+                assert view[block_idx, head_idx].data_ptr() == (
+                    raw.data_ptr() + page_offset + head_idx * state_content_bytes
+                )
+                marker = 1 + (layer_idx * num_blocks + block_idx) * physical_heads + head_idx
+                view[block_idx, head_idx].fill_(marker)
+    # Reading through the independent dense backing catches page or head-slot
+    # aliasing, including the last page of the last layer.
+    for layer_idx in range(len(layer_names)):
+        for block_idx in range(num_blocks):
+            for head_idx in range(physical_heads):
+                marker = 1 + (layer_idx * num_blocks + block_idx) * physical_heads + head_idx
+                assert torch.all(raw_pages[layer_idx, block_idx, :, head_idx] == marker)
 
 
 def test_get_storage_block_size_and_dcp_memory():

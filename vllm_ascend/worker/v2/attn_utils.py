@@ -273,16 +273,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             ratio_kwargs: dict[str, Any] = {"tokens_per_state": compression_ratio}
             spec = AscendMLAAttentionSpec(
                 block_size=spec.block_size,
-                # ``num_heads`` describes physical cache head slots, not query
-                # heads. Kimi K3 publishes one latent KV slot per token; using
-                # the query-head count here makes vLLM's generic planner inflate
-                # each page by the local query-head count.
-                num_heads=(
-                    spec.num_heads
-                    if getattr(vllm_config.model_config.hf_text_config, "model_type", None) == "kimi_linear"
-                    else attn_module.num_heads
-                ),
+                num_query_heads=attn_module.num_heads,
                 num_kv_heads=spec.num_kv_heads,
+                num_head_slots=spec.num_head_slots,
+                state_content_bytes=spec.state_content_bytes,
                 head_size=head_size,
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
@@ -1668,6 +1662,7 @@ def _reshape_kv_cache_v2(
             single_raw_mla_cache = get_single_raw_mla_backing(raw_cache)
 
             if single_raw_mla_cache is not None and _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec):
+                assert isinstance(kv_cache_spec, AscendMLAAttentionSpec)
                 kernel_blocks_per_manager = kv_cache_spec.block_size // kernel_block_size
                 slot_bytes = kv_cache_spec.page_size_bytes // kernel_blocks_per_manager
                 component_shape = (
@@ -1680,7 +1675,7 @@ def _reshape_kv_cache_v2(
 
                 if (
                     get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH)
-                    and kv_cache_spec.num_heads in MLA_FLASH_SUPPORTED_Q_HEADS
+                    and kv_cache_spec.num_query_heads in MLA_FLASH_SUPPORTED_Q_HEADS
                     and get_flashmla_ops() is not None
                     # The outer eligibility check admits only supported PD,
                     # which requires component-major pages at both endpoints.
