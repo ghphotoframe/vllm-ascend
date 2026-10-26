@@ -2,7 +2,6 @@ import vllm.model_executor.layers.mamba.ops.causal_conv1d as _cc1d
 import vllm.third_party.flash_linear_attention.ops as fla_ops
 import vllm.third_party.flash_linear_attention.ops.fused_recurrent as fla_fused_recurrent
 import vllm.third_party.flash_linear_attention.ops.layernorm_guard as fla_layernorm_guard
-from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import next_power_of_2
 
@@ -33,10 +32,10 @@ def _npu_causal_conv1d_update(*args, **kwargs):
     return _npu_causal_conv1d_update_impl(*args, **kwargs)
 
 
-# npu_kda_causal_conv1d_bind: CUDA causal_conv1d kernels use tl.extra.cuda.gdc_wait
-# which Ascend Triton does not provide. Swap the NPU update kernel and a PyTorch
-# prefill fn. Models that live in vllm-ascend import the Ascend entry points
-# directly and do not rely on this rebind.
+# CUDA causal_conv1d kernels use tl.extra.cuda.gdc_wait, which Ascend Triton
+# does not provide. Keep PyTorch compatibility implementations for models that
+# use the upstream Mamba entry points. Ascend Kimi K3 and Bailing V3 (Ling)
+# import FLA AscendC causal_conv1d directly and do not use these wrappers.
 _CC1D_FN_DROP = (
     "null_block_id",
     "block_idx_first_scheduled_token",
@@ -317,21 +316,3 @@ try:
     _mhc_mod.MHCFusedPostPreOp.forward_native = _mhc_fused_post_pre_npu
 except ImportError:
     pass
-
-# npu_kda_causal_conv1d_triton: the PyTorch fallback calls .item() per
-# request, which aborts ACL graph capture. The upstream NPU Triton kernel has
-# no host sync and accepts the spec-decode kwargs the fallback had to drop.
-try:
-    from vllm_ascend.ops.triton.mamba.causal_conv1d import (  # type: ignore[attr-defined]
-        causal_conv1d_update_npu as _cc1d_update_npu,
-    )
-
-    _cc1d.causal_conv1d_update = _cc1d_update_npu
-    logger.debug("Bound the NPU Triton causal_conv1d_update for the KDA layers.")
-except Exception as _cc1d_err:
-    logger.warning(
-        "NPU Triton causal_conv1d_update is unavailable (%s); falling back to the"
-        " PyTorch implementation, which syncs per request and therefore stalls ACL"
-        " graph capture at decode-FULL.",
-        _cc1d_err,
-    )

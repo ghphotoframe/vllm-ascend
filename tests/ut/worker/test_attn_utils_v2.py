@@ -501,7 +501,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
     num_blocks = 2
     spec = AscendMLAAttentionSpec(
         block_size=384,
-        num_heads=64,
+        num_query_heads=64,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
@@ -583,7 +583,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
 
     monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: flash_profile)
     for q_heads in (8, 12, 64, 96):
-        spec = replace(spec, num_heads=q_heads)
+        spec = replace(spec, num_query_heads=q_heads)
         fused = reshape()
         assert isinstance(fused, torch.Tensor)
         assert fused.shape == (6, 128, 1, 576)
@@ -591,7 +591,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
 
     # The resolved backend rejects unsupported query-head counts before cache
     # allocation, so FIA receives the component-major view even on A5.
-    spec = replace(spec, num_heads=48)
+    spec = replace(spec, num_query_heads=48)
     attn_module.impl.use_flashmla = False
     a5_fallback = reshape()
     assert isinstance(a5_fallback, tuple)
@@ -600,7 +600,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
     # FIA-compatible component-major layout.
     # Backend selection has already resolved missing operator APIs to FIA.
     attn_module.impl.use_flashmla = False
-    spec = replace(spec, num_heads=64)
+    spec = replace(spec, num_query_heads=64)
     missing_flashmla_ops = reshape()
     assert isinstance(missing_flashmla_ops, tuple)
 
@@ -1115,16 +1115,16 @@ def test_gqa_pcp_dcp_cache_keeps_tp_local_kv_heads(monkeypatch, dcp_size):
     assert specs["model.layers.0.self_attn.attn"].num_kv_heads == 1
 
 
-@pytest.mark.parametrize(
-    ("model_type", "expected_num_heads"),
-    [("kimi_linear", 1), ("deepseek_v3", 12)],
-)
-def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type, expected_num_heads):
+@pytest.mark.parametrize("model_type", ["kimi_linear", "deepseek_v3", "bailing_hybrid", "bailing_hybrid_v3_mtp"])
+@pytest.mark.parametrize("num_head_slots", [None, 2])
+def test_mla_cache_spec_separates_physical_and_query_heads(monkeypatch, model_type, num_head_slots):
     source_spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=576,
         dtype=torch.bfloat16,
+        num_head_slots=num_head_slots,
+        state_content_bytes=576 if num_head_slots == 2 else None,
     )
     layer = MLAAttention.__new__(MLAAttention)
     layer.impl = SimpleNamespace(
@@ -1159,7 +1159,10 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(monkeypatch, model_type,
     spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
 
     assert isinstance(spec, AscendMLAAttentionSpec)
-    assert spec.num_heads == expected_num_heads
+    assert spec.num_heads == source_spec.num_heads
+    assert spec.num_query_heads == layer.num_heads
+    assert spec.num_head_slots == source_spec.num_head_slots
+    assert spec.state_content_bytes == source_spec.state_content_bytes
     assert spec.page_size_bytes == source_spec.page_size_bytes
 
 
@@ -2489,8 +2492,10 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
     specs = attn_utils.get_kv_cache_spec(vllm_config)
     assert set(specs) == {"fa", "sfa"}
     assert specs["fa"].head_size == 128
-    assert specs["fa"].num_heads == 64
-    assert specs["sfa"].num_heads == 64
+    assert specs["fa"].num_heads == 1
+    assert specs["sfa"].num_heads == 1
+    assert specs["fa"].num_query_heads == 64
+    assert specs["sfa"].num_query_heads == 64
     assert specs["sfa"].cache_sparse_sfa_c8 is True
 
     mla_spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
