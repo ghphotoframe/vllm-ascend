@@ -272,16 +272,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             ratio_kwargs: dict[str, Any] = {"tokens_per_state": compression_ratio}
             spec = AscendMLAAttentionSpec(
                 block_size=spec.block_size,
-                # ``num_heads`` describes physical cache head slots, not query
-                # heads. Kimi K3 publishes one latent KV slot per token; using
-                # the query-head count here makes vLLM's generic planner inflate
-                # each page by the local query-head count.
-                num_heads=(
-                    spec.num_heads
-                    if getattr(vllm_config.model_config.hf_text_config, "model_type", None) == "kimi_linear"
-                    else attn_module.num_heads
-                ),
+                num_query_heads=attn_module.num_heads,
                 num_kv_heads=spec.num_kv_heads,
+                num_head_slots=getattr(spec, "num_head_slots", None),
+                state_content_bytes=getattr(spec, "state_content_bytes", None),
                 head_size=head_size,
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,

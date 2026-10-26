@@ -954,7 +954,43 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     _ASCEND_CUSTOMOP_IS_REIGISTERED = True
 
 
-def register_ascend_fla_customop():
+def _register_ascend_bailing_v3_kda(vllm_config: VllmConfig) -> None:
+    """Import Ling's FLA-dependent model only for a selected Ling worker."""
+    if get_current_hardware_profile().supports(HardwareCapability.COMPATIBILITY_OP_IMPLEMENTATIONS):
+        return
+
+    architectures = {"BailingMoeV3ForCausalLM", "BailingMoeV3VLForConditionalGeneration", "BailingMoeV3MTPModel"}
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    for model_config in (
+        getattr(vllm_config, "model_config", None),
+        getattr(speculative_config, "draft_model_config", None),
+    ):
+        architecture = getattr(model_config, "architecture", None)
+        if architecture is not None:
+            if architecture not in architectures:
+                continue
+        else:
+            hf_config = getattr(model_config, "hf_config", None)
+            configs = (
+                hf_config,
+                getattr(model_config, "hf_text_config", None),
+                getattr(hf_config, "text_config", None),
+            )
+            if not any(architectures.intersection(getattr(config, "architectures", None) or []) for config in configs):
+                continue
+        try:
+            from vllm_ascend.ops.bailing_moe_v3_kda import AscendBailingMoeV3KimiDeltaAttention
+        except ModuleNotFoundError as exc:
+            if exc.name != "vllm.model_executor.models.bailing_moe_v3":
+                raise
+            raise RuntimeError(
+                "Ling V3 on Ascend requires a vLLM build containing vllm.model_executor.models.bailing_moe_v3."
+            ) from exc
+        REGISTERED_ASCEND_OPS["BailingMoeV3KimiDeltaAttention"] = AscendBailingMoeV3KimiDeltaAttention
+        return
+
+
+def register_ascend_fla_customop(vllm_config=None):
     """Resolve the FLA subclass after selecting a device, before model loading.
 
     Registration happens once inside the imported module, under Python's
@@ -963,6 +999,8 @@ def register_ascend_fla_customop():
     from vllm_ascend.ops.fused_rms_norm_gated import AscendFusedRMSNormGated
 
     REGISTERED_ASCEND_OPS["FusedRMSNormGated"] = AscendFusedRMSNormGated
+    if vllm_config is not None:
+        _register_ascend_bailing_v3_kda(vllm_config)
     return AscendFusedRMSNormGated
 
 
@@ -1718,7 +1756,7 @@ def enable_dsa_cp_full_o_proj() -> bool:
 
 def check_gdn_layer(vllm_config) -> bool:
     """
-    Detect a model with GDN attention from either supported HF config shape.
+    Detect GDN/KDA attention from either supported HF config shape.
     """
     if not hasattr(vllm_config, "model_config"):
         return False
@@ -1731,6 +1769,9 @@ def check_gdn_layer(vllm_config) -> bool:
     for config in (hf_config, getattr(hf_config, "text_config", None)):
         if config is None:
             continue
+        # Ling V3 text configs may omit both attention-type fields below.
+        if "BailingMoeV3ForCausalLM" in (getattr(config, "architectures", None) or []):
+            return True
         # Most hybrid models expose layer_types. Kimi Linear/K3 instead
         # exposes the equivalent is_linear_attn property.
         layer_types = getattr(config, "layer_types", None) or []

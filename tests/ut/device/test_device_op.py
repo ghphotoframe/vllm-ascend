@@ -219,8 +219,8 @@ def test_a5_reshape_and_cache_uses_bsnd_view_for_bnsd():
 
 @pytest.mark.parametrize("adaptor", [BaseDeviceAdaptor, A5DeviceAdaptor])
 def test_kv_cache_load_makes_seq_lens_contiguous(adaptor):
-    cache_kv_c = object()
-    cache_k_pe = object()
+    cache_kv_c = torch.empty(2, 128, 1, 512)
+    cache_k_pe = torch.empty(2, 128, 1, 64)
     block_table = object()
     context_seq_len_npu = torch.arange(8, dtype=torch.int32)[::2]
     seq_starts = object()
@@ -259,8 +259,9 @@ def test_kv_cache_load_makes_seq_lens_contiguous(adaptor):
     [(BaseDeviceAdaptor, False), (A5DeviceAdaptor, False), (A5DeviceAdaptor, True)],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_kv_cache_load_passes_strided_views_directly_to_native(adaptor, token_fused, dtype):
-    blocks, block_size, key_dim, rope_dim = 3, 128, 512, 64
+@pytest.mark.parametrize("block_size", [128, 384])
+def test_kv_cache_load_preserves_native_inputs_when_fallback_declines(adaptor, token_fused, dtype, block_size):
+    blocks, key_dim, rope_dim = 3, 512, 64
     prefix = 256
     page_elements = block_size * (key_dim + rope_dim) + 128
     raw = torch.empty(prefix + blocks * page_elements, dtype=dtype)
@@ -273,14 +274,18 @@ def test_kv_cache_load_passes_strided_views_directly_to_native(adaptor, token_fu
     )
     table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
     lengths = torch.tensor([127], dtype=torch.int32)
-    offsets = torch.tensor([128], dtype=torch.int32)
+    offsets = torch.tensor([block_size], dtype=torch.int32)
     key = torch.empty(127, 1, key_dim, dtype=dtype)
     value = torch.empty(127, 1, rope_dim, dtype=dtype)
     assert not cache_k.is_contiguous() and not cache_v.is_contiguous()
 
-    with mock.patch("vllm_ascend.device.device_op.torch_npu.npu_gather_pa_kv_cache") as gather:
+    with (
+        mock.patch("vllm_ascend.device.device_op.try_load_strided_mla_cache", return_value=False) as fallback,
+        mock.patch("vllm_ascend.device.device_op.torch_npu.npu_gather_pa_kv_cache") as gather,
+    ):
         adaptor.kv_cache_load(cache_k, cache_v, table, lengths, offsets, key, value)
 
+    fallback.assert_called_once_with(cache_k, cache_v, table, lengths, offsets, key, value)
     gather.assert_called_once()
     # Identity preserves both the physical page stride and component offset;
     # making a dense copy of either cache would violate this contract.
@@ -290,6 +295,18 @@ def test_kv_cache_load_passes_strided_views_directly_to_native(adaptor, token_fu
     assert gather.call_args.kwargs["key"] is key
     assert gather.call_args.kwargs["value"] is value
     assert gather.call_args.kwargs["is_seq_lens_cumsum"] is False
+
+
+@pytest.mark.parametrize("adaptor", [BaseDeviceAdaptor, A5DeviceAdaptor])
+def test_kv_cache_load_returns_after_strided_fallback(adaptor):
+    inputs = tuple(object() for _ in range(7))
+    with (
+        mock.patch("vllm_ascend.device.device_op.try_load_strided_mla_cache", return_value=True) as fallback,
+        mock.patch("vllm_ascend.device.device_op.torch_npu.npu_gather_pa_kv_cache") as gather,
+    ):
+        adaptor.kv_cache_load(*inputs)
+    fallback.assert_called_once_with(*inputs)
+    gather.assert_not_called()
 
 
 @pytest.mark.parametrize(

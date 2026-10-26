@@ -765,6 +765,76 @@ class TestQuantPrefixMapper(TestBase):
 
         self.assertEqual(prefix, "language_model.lm_head")
 
+    def test_bailing_quant_mapping_preserves_kda_projection_over_legacy_dense(self):
+        for model_type in ("bailing_hybrid", "bailing_hybrid_v3_mtp"):
+            with self.subTest(model_type=model_type):
+                prefix = "model.layers.0.self_attn.o_proj"
+                config = AscendModelSlimConfig(
+                    {
+                        f"{prefix}.weight": "W8A8_DYNAMIC",
+                        "model.layers.0.attention.dense.weight": "FLOAT",
+                    }
+                )
+                config.packed_modules_mapping = {}
+                config._update_packed_modules_mapping(model_type)
+                self.assertNotIn("o_proj", config.packed_modules_mapping)
+                self.assertEqual(config.quant_prefix_mapper(model_type, prefix), prefix)
+                self.assertEqual(
+                    get_quant_type_for_layer(
+                        config.quant_description,
+                        prefix,
+                        config.packed_modules_mapping,
+                        prefix_mapper=lambda name, config=config, model_type=model_type: config.quant_prefix_mapper(
+                            model_type, name
+                        ),
+                    ),
+                    "W8A8_DYNAMIC",
+                )
+
+    def test_bailing_quant_mapping_supports_legacy_attention_and_packed_projections(self):
+        for model_type in ("bailing_hybrid", "bailing_hybrid_v3_mtp"):
+            config = AscendModelSlimConfig(
+                {
+                    "model.layers.0.attention.dense.weight": "FLOAT",
+                    "model.layers.0.attention.q_proj.weight": "W8A8_DYNAMIC",
+                    "model.layers.0.attention.k_proj.weight": "W8A8_DYNAMIC",
+                    "model.layers.0.attention.v_proj.weight": "W8A8_DYNAMIC",
+                }
+            )
+            config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+            for namespace in ("self_attn", "linear_attn"):
+                with self.subTest(model_type=model_type, namespace=namespace):
+                    self.assertEqual(
+                        config.quant_prefix_mapper(model_type, f"model.layers.0.{namespace}.o_proj"),
+                        "model.layers.0.attention.dense",
+                    )
+                    prefix = f"model.layers.0.{namespace}.qkv_proj"
+                    self.assertEqual(
+                        get_quant_type_for_layer(
+                            config.quant_description,
+                            prefix,
+                            config.packed_modules_mapping,
+                            prefix_mapper=lambda name, config=config, model_type=model_type: config.quant_prefix_mapper(
+                                model_type, name
+                            ),
+                        ),
+                        "W8A8_DYNAMIC",
+                    )
+
+    def test_bailing_mtp_quant_mapping_prefers_own_head_then_shared_lm_head(self):
+        prefix = "model.layers.60.shared_head.head"
+        config = AscendModelSlimConfig({"lm_head.weight": "FLOAT"})
+        config.packed_modules_mapping = {}
+        self.assertEqual(config.quant_prefix_mapper("bailing_hybrid_v3_mtp", prefix), "lm_head")
+        config.quant_description[f"{prefix}.weight"] = "W8A8_DYNAMIC"
+        self.assertEqual(config.quant_prefix_mapper("bailing_hybrid_v3_mtp", prefix), prefix)
+
+    def test_bailing_quant_aliases_do_not_apply_to_other_models(self):
+        prefix = "model.layers.0.self_attn.o_proj"
+        config = AscendModelSlimConfig({"model.layers.0.attention.dense.weight": "FLOAT"})
+        config.packed_modules_mapping = {}
+        self.assertEqual(config.quant_prefix_mapper("kimi_linear", prefix), prefix)
+
     def test_lm_head_keeps_original_prefix_when_quant_key_exists(self):
         config = AscendModelSlimConfig(
             {
