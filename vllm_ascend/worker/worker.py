@@ -502,7 +502,7 @@ class NPUWorker(WorkerBase):
         self.device = self._init_device()
         # FLA import-time capability queries must run on the selected worker
         # device, and registration must finish before any model is constructed.
-        register_ascend_fla_customop()
+        register_ascend_fla_customop(self.vllm_config)
         # Initialize workspace manager
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)

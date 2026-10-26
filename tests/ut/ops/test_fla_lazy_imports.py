@@ -126,8 +126,9 @@ class TestFLALazyImports(unittest.TestCase):
             events.append("device")
             return object()
 
+        register = Mock(side_effect=lambda _config: events.append("register"))
         namespace = {
-            "register_ascend_fla_customop": lambda: events.append("register"),
+            "register_ascend_fla_customop": register,
             "init_workspace_manager": Mock(),
             "NPUModelRunner": lambda *args: events.append("model_runner"),
         }
@@ -140,6 +141,7 @@ class TestFLALazyImports(unittest.TestCase):
         )
         init_device(worker)
         self.assertEqual(events, ["device", "register", "model_runner"])
+        register.assert_called_once_with(worker.vllm_config)
 
 
 class TestFLAImportBoundaries(unittest.TestCase):
