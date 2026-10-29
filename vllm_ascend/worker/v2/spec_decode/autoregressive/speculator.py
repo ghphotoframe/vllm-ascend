@@ -82,6 +82,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
     """
 
     model_state: "AscendModelState"
+    _mrope_decode_delta: torch.Tensor | None = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         """Override the upstream __init__ for Ascend NPUs.
@@ -119,6 +120,11 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         # when in decode phase of eagle speculator, we need some value in
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None
+        self._mrope_decode_delta = (
+            torch.zeros(self.max_num_reqs, dtype=torch.int64, device=device)
+            if vllm_config.model_config.use_mla and vllm_config.model_config.uses_mrope
+            else None
+        )
         self.pcp_manager: AscendPCPManager | None = None
         self._sparse_kv_offload_metadata = SparseKVOffloadMetadata(
             enabled=get_ascend_config().sparse_kv_offload_config.enabled,
@@ -332,6 +338,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         generate_draft.
         """
         self.input_batch = input_batch
+        self._prepare_mrope_decode_delta(input_batch, dummy_run)
         # Replicated drafts use global tokens, unlike the PCP-local target.
         # Every DP rank must take the draft sync, including decode and idle ranks.
         sync_state = None if self.replicated_pcp else dp_sync
@@ -360,6 +367,29 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
                 mm_inputs,
                 is_profile=is_profile,
             )
+
+    def _prepare_mrope_decode_delta(self, input_batch: InputBatch, dummy_run: bool) -> None:
+        if self._mrope_decode_delta is None:
+            return
+        # UvaBackedTensor can rotate its backing allocation each scheduler
+        # iteration. Capture only this stable device buffer, never the UVA
+        # prefill_delta address or an absolute-position buffer modified in place.
+        self._mrope_decode_delta.zero_()
+        if not dummy_run:
+            rope_state = self.model_state.rope_state
+            self._mrope_decode_delta[: input_batch.num_reqs].copy_(
+                rope_state.prefill_delta.gpu[input_batch.idx_mapping]
+            )
+
+    def _get_mrope_decode_positions(self, num_tokens: int, step: int) -> torch.Tensor | None:
+        if self._mrope_decode_delta is None or step == 0:
+            return None
+        # Later MTP steps are one generated token per request. All three
+        # axes then equal absolute position + the prompt's M-RoPE delta.
+        # Step 0 reuses target metadata, including actual image coordinates.
+        if num_tokens > self._mrope_decode_delta.numel():
+            raise ValueError("M-RoPE draft decode requires one token per request")
+        return self.input_buffers.positions[:num_tokens] + self._mrope_decode_delta[:num_tokens]
 
     def set_attn(
         self,
@@ -576,6 +606,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         offload_kwargs = self._sparse_kv_offload_metadata.build_kwargs(
             self.input_batch, self.model_state, num_reqs, batch_desc, query_start_loc_np, step
         )
+        rotary_positions = self._get_mrope_decode_positions(batch_desc.num_tokens, step)
         with build_attn_metadata_factory(
             self.input_buffers.positions,
             batch_desc.num_tokens,
@@ -583,6 +614,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
             seq_lens_cpu=seq_lens_cpu,
             parallel_config=self.draft_vllm_config.parallel_config,
             offload_kwargs=offload_kwargs,
+            rotary_positions=rotary_positions,
         ):
             attn_metadata = super()._build_attn_metadata(
                 num_reqs,

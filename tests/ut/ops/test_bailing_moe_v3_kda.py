@@ -56,6 +56,11 @@ def test_init_enforces_recurrent_sequence_length_limit(num_speculative_tokens):
     def fake_base_init(instance, *_args, **_kwargs):
         nn.Module.__init__(instance)
         instance.num_speculative_tokens = num_speculative_tokens
+        instance.model_config = SimpleNamespace(dtype=torch.bfloat16)
+        instance.conv_size = 4
+        instance.projection_size_per_partition = 6
+        instance.q_conv1d = nn.Module()
+        instance.q_conv1d.weight = nn.Parameter(torch.empty(6, 1, 4))
 
     with (
         patch.object(BailingMoeV3KimiDeltaAttention, "__init__", fake_base_init),
@@ -397,7 +402,7 @@ def test_causal_conv_updates_only_active_cache_rows(layout, cache_dtype, run_mod
     initial_state_mode = torch.tensor([True, False, True, False, True])
     accepted = torch.ones(5, dtype=torch.int32)
     result = torch.full_like(mixed_qkv, 11)
-    staged = layout != "sd" or cache_dtype != mixed_qkv.dtype
+    staged = layout == "ds" or cache_dtype != mixed_qkv.dtype
 
     def copy_state(cache, packed, indices, starts, packed_indices, *, write_back):
         assert packed.shape == (5, 3, 6)  # Requests, never the nine-slot pool.
@@ -415,7 +420,7 @@ def test_causal_conv_updates_only_active_cache_rows(layout, cache_dtype, run_mod
     def apply_conv(input_, weight, state, indices, kwargs):
         assert input_ is mixed_qkv and weight is conv_weights_t
         assert state.dtype == mixed_qkv.dtype
-        assert state.is_contiguous()
+        assert state.is_contiguous() if staged else state.stride(-1) == 1
         assert indices.dim() == 1 and indices.is_contiguous()
         assert kwargs["query_start_loc"] is query_start_loc
         assert kwargs["activation"] == "silu"
@@ -425,7 +430,7 @@ def test_causal_conv_updates_only_active_cache_rows(layout, cache_dtype, run_mod
             assert indices.tolist() == [0, expected_null_block_id, expected_null_block_id, expected_null_block_id, 4]
         else:
             assert state is storage
-            assert indices.tolist() == [2, NULL_BLOCK_ID, 5, NULL_BLOCK_ID, 4]
+            assert indices.tolist() == [2, NULL_BLOCK_ID, NULL_BLOCK_ID, NULL_BLOCK_ID, 4]
         pad_slot_id = kwargs.get("pad_slot_id")
         for request, slot in enumerate(indices.tolist()):
             if slot == kwargs["null_block_id"] or slot == pad_slot_id:
@@ -450,8 +455,8 @@ def test_causal_conv_updates_only_active_cache_rows(layout, cache_dtype, run_mod
 
     with (
         patch("vllm_ascend.ops.bailing_moe_v3_kda.copy_conv_state", side_effect=copy_state) as copy_op,
-        patch("vllm_ascend.ops.bailing_moe_v3_kda.causal_conv1d_fn", side_effect=prefill) as prefill_op,
-        patch("vllm_ascend.ops.bailing_moe_v3_kda.causal_conv1d_update", side_effect=decode) as decode_op,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_fn", side_effect=prefill) as prefill_op,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=decode) as decode_op,
     ):
         actual = attention._run_causal_conv1d(
             mixed_qkv,
@@ -521,7 +526,7 @@ def test_causal_conv_packed_all_null_mrv2_uses_nonnegative_sentinel():
 
     with (
         patch("vllm_ascend.ops.bailing_moe_v3_kda.copy_conv_state", side_effect=copy_state) as copy_op,
-        patch("vllm_ascend.ops.bailing_moe_v3_kda.causal_conv1d_update", side_effect=decode) as decode_op,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=decode) as decode_op,
     ):
         actual = attention._run_causal_conv1d(
             mixed_qkv,

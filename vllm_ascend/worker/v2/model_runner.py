@@ -1041,6 +1041,13 @@ class NPUModelRunner(GPUModelRunner):
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)
 
+        # V2 prepares attention metadata before model-state model inputs. MLA
+        # consumes M-RoPE here, while cache slots and Mamba retain absolute 1D
+        # positions. Preparing after metadata would reuse the previous batch.
+        prepare_rotary = getattr(self.model_state, "prepare_attn_rotary_positions", None)
+        if prepare_rotary is not None:
+            prepare_rotary(input_batch, self.req_states)
+
         return input_batch
 
     def prepare_dummy_attn(

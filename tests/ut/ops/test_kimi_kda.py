@@ -481,31 +481,115 @@ def test_kda_empty_forward_context_clears_preallocated_output():
     assert torch.equal(core_attn_out, torch.zeros_like(core_attn_out))
 
 
-def test_kda_conv_weight_is_packed_once_in_kernel_layout():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_kda_conv_weight_reload_preserves_packed_storage(dtype):
     attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
     nn.Module.__init__(attention)
     attention.conv_size = 4
     attention.local_projection_size = 6
     attention.conv1d = nn.Module()
     source = torch.arange(18 * 4, dtype=torch.float32).reshape(18, 1, 4)
-    attention.conv1d.weight = nn.Parameter(source)
+    attention.conv1d.weight = nn.Parameter(source.clone())
     attention.register_parameter(
         _PACKED_CONV_WEIGHT_NAME,
-        nn.Parameter(torch.empty(4, 18, dtype=torch.bfloat16), requires_grad=False),
+        nn.Parameter(torch.empty(4, 18, dtype=dtype), requires_grad=False),
     )
     original = attention.get_parameter(_PACKED_CONV_WEIGHT_NAME)
     original_ptr = original.data_ptr()
 
-    attention._pack_conv_weights()
+    for update in range(3):
+        # Same shape and dtype do not imply unchanged checkpoint values.
+        current = source + 100 * update
+        with torch.no_grad():
+            attention.conv1d.weight.copy_(current)
+        attention._pack_conv_weights()
 
+        packed = attention.get_parameter(_PACKED_CONV_WEIGHT_NAME)
+        assert packed is original
+        assert packed.data_ptr() == original_ptr
+        assert packed.dtype == dtype
+        assert packed.is_contiguous()
+        torch.testing.assert_close(packed, current[:, 0, :].transpose(0, 1).to(dtype), rtol=0, atol=0)
+
+
+def test_kda_conv_pack_runs_after_child_postload_on_every_update():
+    source = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4)
+
+    def fake_upstream_init(attention, _config, _vllm_config, _prefix):
+        nn.Module.__init__(attention)
+        attention.o_norm = SimpleNamespace(eps=1e-5)
+        attention.conv_size = 4
+        attention.local_projection_size = 2
+        attention.model_config = SimpleNamespace(dtype=torch.bfloat16)
+        attention.conv1d = nn.Module()
+        attention.conv1d.weight = nn.Parameter(torch.empty_like(source))
+
+        def child_postload(update):
+            with torch.no_grad():
+                attention.conv1d.weight.copy_(source + update)
+            return update
+
+        attention.conv1d.quant_method = SimpleNamespace(process_weights_after_loading=child_postload)
+
+    with patch("vllm_ascend.ops.kimi_kda.KimiK3DeltaAttention.__init__", new=fake_upstream_init):
+        attention = AscendKimiK3DeltaAttention(SimpleNamespace(rms_norm_eps=1e-6), SimpleNamespace())
     packed = attention.get_parameter(_PACKED_CONV_WEIGHT_NAME)
-    assert packed.data_ptr() == original_ptr
-    assert packed.dtype == torch.bfloat16
-    assert packed.is_contiguous()
-    torch.testing.assert_close(
-        packed,
-        source[:, 0, :].transpose(0, 1).to(torch.bfloat16),
-    )
+    original_ptr = packed.data_ptr()
+
+    for update in (0, 10, 20):
+        assert attention.conv1d.quant_method.process_weights_after_loading(update) == update
+        assert attention.get_parameter(_PACKED_CONV_WEIGHT_NAME) is packed
+        assert packed.data_ptr() == original_ptr
+        torch.testing.assert_close(packed, (source[:, 0, :] + update).T.to(torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode", "mtp"])
+@pytest.mark.parametrize("indices_2d", [False, True])
+def test_kimi_native_conv_preserves_cache_view_and_metadata(mode, indices_2d):
+    x = torch.ones(4, 6, dtype=torch.bfloat16)
+    weight = torch.ones(4, 6, dtype=x.dtype)
+    state = torch.zeros(8, 6, 6, dtype=x.dtype)[::2]
+    indices = torch.tensor([[1, 2], [3, 2]], dtype=torch.int32)
+    indices = indices if indices_2d else indices[:, 0]
+    starts = torch.tensor([0, 2, 4], dtype=torch.int32)
+    initial = torch.tensor([True, False]) if mode == "prefill" else None
+    accepted = torch.tensor([1, 2], dtype=torch.int32) if mode == "mtp" else None
+    expected = torch.full_like(x, 7)
+    with (
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_fn", return_value=expected) as prefill,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", return_value=expected) as update,
+    ):
+        actual = AscendKimiK3DeltaAttention._run_causal_conv1d(
+            x,
+            weight,
+            state,
+            starts,
+            indices,
+            initial,
+            run_mode=0 if mode == "prefill" else 1,
+            max_query_len=2,
+            num_accepted_tokens=accepted,
+        )
+    assert actual is expected
+    call = prefill.call_args if mode == "prefill" else update.call_args
+    assert call.args[0] is x
+    assert call.kwargs["query_start_loc"] is starts
+    assert call.kwargs["null_block_id"] == 0
+    assert call.kwargs["activation"] == "silu"
+    if mode == "prefill":
+        update.assert_not_called()
+        assert call.kwargs["conv_states"] is state
+        assert call.kwargs["has_initial_state"] is initial
+        normalized = call.kwargs["cache_indices"]
+    else:
+        prefill.assert_not_called()
+        assert call.args[1] is state
+        assert call.kwargs["num_accepted_tokens"] is accepted
+        assert call.kwargs["max_query_len"] == 2
+        assert call.kwargs["out"].data_ptr() != x.data_ptr()
+        normalized = call.kwargs["conv_state_indices"]
+    assert normalized.is_contiguous() and normalized.tolist() == [1, 3]
+    torch.testing.assert_close(x, torch.ones_like(x))
 
 
 @pytest.mark.parametrize("mode", ["spec", "decode", "mixed"])

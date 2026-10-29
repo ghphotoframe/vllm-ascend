@@ -147,9 +147,30 @@ class AscendModelState(DefaultModelState):
         return super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
 
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
-        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if getattr(self, "rope_state", None) is not None and self.model_config.use_mla:
+            # MLA has already consumed these positions while preparing its
+            # metadata, before model_runner calls this method.
+            model_inputs = {"positions": self.rope_state.get_positions(input_batch.num_tokens_after_padding)}
+        else:
+            model_inputs = super().prepare_inputs(input_batch, req_states)
         model_inputs.update(self.prepare_engram_inputs(input_batch, req_states))
         return model_inputs
+
+    def prepare_attn_rotary_positions(self, input_batch, req_states) -> None:
+        if getattr(self, "rope_state", None) is None or not self.model_config.use_mla:
+            return
+        self.rope_state.prepare_positions(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            req_states.prefill_len.gpu,
+            req_states.num_computed_tokens.gpu,
+        )
+        self.rope_state.positions[:, input_batch.num_tokens : input_batch.num_tokens_after_padding].zero_()
+
+    def get_attn_rotary_positions(self, num_tokens: int) -> torch.Tensor | None:
+        if getattr(self, "rope_state", None) is not None and self.model_config.use_mla:
+            return self.rope_state.get_positions(num_tokens)
+        return None
 
     def prepare_engram_inputs(self, input_batch, req_states) -> dict[str, Any]:
         """Model-specific history providers override this single preparation hook."""
@@ -305,6 +326,7 @@ class AscendModelState(DefaultModelState):
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
             positions=input_batch.positions,
+            rotary_positions=self.get_attn_rotary_positions(num_input_tokens),
             attn_state=input_batch.attn_state,
             pcp_context=pcp_context,
             for_cudagraph_capture=for_capture,

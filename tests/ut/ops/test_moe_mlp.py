@@ -7,9 +7,10 @@ import torch_npu  # noqa: F401 -- registers torch.npu used by the module under t
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
-from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
 from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
+from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoETokenDispatchOutput
 from vllm_ascend.ops.fused_moe.moe_mlp import _unified_apply_activation, apply_moe_mlp
 from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.quantization.methods.w4a8.w4a8 import AscendW4A8DynamicFusedMoEMethod
@@ -592,15 +593,77 @@ class TestUnifiedApplyActivation(unittest.TestCase):
         up = linear_beta * torch.tanh(up / linear_beta)
         self.assertTrue(torch.allclose(out, gate * up))
 
-    def test_swiglustep_uses_hardcoded_limit(self):
-        with patch(f"{MOE_MLP}.AscendSwigluStepAndMul.swiglustep_forward", return_value="out") as mock_act:
-            out = _unified_apply_activation(
-                _mlp_compute_input(activation=MoEActivation.SWIGLUSTEP, swiglu_limit=5.0),
-                "x",
-                self._quant_method(),
-            )
-        self.assertEqual(out, "out")
-        mock_act.assert_called_once_with("x", limit=7.0)
+    def _assert_swiglustep_math(self, mlp_compute_input, limit):
+        gate = torch.tensor(
+            [[-20.0, -2.0, -0.5, 0.0, 3.99, 4.0, 4.01, 5.0, 6.9, 7.0, 7.1, 9.99, 10.0, 10.01, 12.0, 100.0]]
+        )
+        up = torch.tensor(
+            [[-100.0, -10.0, -4.0, -1.0, 1.0, 2.0, 5.0, 100.0, -100.0, -8.0, -7.0, -5.0, 4.0, 7.0, 10.0, 100.0]]
+        )
+        x = torch.cat((gate, up), dim=-1)
+        original = x.clone()
+        # Exercise the real dispatch, Ascend wrapper and native activation on CPU.
+        with patch("vllm.triton_utils.HAS_TRITON", False):
+            out = _unified_apply_activation(mlp_compute_input, x, self._quant_method())
+        gate64, up64 = gate.double(), up.double()
+        expected = (gate64 * torch.sigmoid(gate64)).clamp(max=limit) * up64.clamp(-limit, limit)
+        torch.testing.assert_close(out, expected.float(), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(x, original, rtol=0, atol=0)
+        # These inputs must reject the old clamp-before-SiLU order as well.
+        clipped_gate = gate64.clamp(max=limit)
+        wrong_order = clipped_gate * torch.sigmoid(clipped_gate) * up64.clamp(-limit, limit)
+        self.assertFalse(torch.allclose(out.double(), wrong_order, rtol=1e-6, atol=1e-6))
+
+    def test_swiglustep_uses_configured_positive_limit(self):
+        for configured_limit in (4.0, 10.0):
+            with self.subTest(limit=configured_limit):
+                self._assert_swiglustep_math(
+                    _mlp_compute_input(activation=MoEActivation.SWIGLUSTEP, swiglu_limit=configured_limit),
+                    configured_limit,
+                )
+
+    def test_swiglustep_zero_keeps_legacy_default(self):
+        self._assert_swiglustep_math(_mlp_compute_input(activation=MoEActivation.SWIGLUSTEP, swiglu_limit=0.0), 7.0)
+
+    def test_swiglustep_none_at_activation_entry_keeps_legacy_default(self):
+        # Also protect callers passing the optional config value directly,
+        # without the builder's normalization to a resolved float.
+        self._assert_swiglustep_math(SimpleNamespace(activation=MoEActivation.SWIGLUSTEP, swiglu_limit=None), 7.0)
+
+    def test_swiglustep_builder_and_activation_keep_legacy_defaults(self):
+        # The builder retains zero for an unspecified limit. Like quantized
+        # MoE LoRA, the activation uses seven for both zero and None.
+        for kwargs, stored_limit, activation_limit in (
+            ({}, 0.0, 7.0),
+            ({"swiglu_limit": None}, 0.0, 7.0),
+            ({"swiglu_limit": 0.0}, 0.0, 7.0),
+            ({"swiglu_limit": 4.0}, 4.0, 4.0),
+            ({"swiglu_limit": 10.0}, 10.0, 10.0),
+        ):
+            with self.subTest(kwargs=kwargs):
+                layer = SimpleNamespace(
+                    moe_config=SimpleNamespace(activation_situ_beta=None, activation_situ_linear_beta=None, **kwargs)
+                )
+                fused = build_fused_experts_input(
+                    hidden_states=torch.zeros(1, 32),
+                    topk_weights=torch.ones(1, 1),
+                    topk_ids=torch.zeros(1, 1, dtype=torch.int32),
+                    layer=layer,
+                    quant_type=QuantType.NONE,
+                    dynamic_eplb=False,
+                    activation=MoEActivation.SWIGLUSTEP,
+                )
+                dispatch = MoETokenDispatchOutput(
+                    hidden_states=fused.hidden_states,
+                    group_list=torch.tensor([1]),
+                    group_list_type=1,
+                    combine_metadata=SimpleNamespace(),
+                )
+                mlp = build_mlp_compute_input(
+                    fused_experts_input=fused, token_dispatch_output=dispatch, use_fusion_ops=False
+                )
+                self.assertEqual(mlp.swiglu_limit, stored_limit)
+                self._assert_swiglustep_math(mlp, activation_limit)
 
     def test_swigluoai_uninterleave_uses_clipped_swiglu(self):
         with patch(f"{MOE_MLP}.DeviceOperator.clipped_swiglu", return_value="out") as mock_act:

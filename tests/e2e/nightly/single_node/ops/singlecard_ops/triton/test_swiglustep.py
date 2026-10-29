@@ -66,6 +66,66 @@ def test_swiglustep_triton_clamps_to_golden_value():
     assert not torch.isinf(out).any()
 
 
+@pytest.mark.parametrize("limit", [4.0, 10.0])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_swiglustep_triton_configured_limit_boundaries(limit, dtype):
+    """Configured bounds preserve SiLU-before-clamp, signs and input storage."""
+    init_device_properties_triton()
+    gate = torch.tensor(
+        [
+            -100.0,
+            -20.0,
+            -2.0,
+            -0.5,
+            0.0,
+            1.0,
+            limit - 0.125,
+            limit,
+            limit + 0.125,
+            limit + 1.0,
+            7.0,
+            8.0,
+            10.0,
+            12.0,
+            20.0,
+            100.0,
+        ],
+        dtype=dtype,
+    )
+    up = torch.tensor(
+        [
+            -100.0,
+            -10.0,
+            -4.0,
+            -1.0,
+            0.0,
+            0.5,
+            1.0,
+            limit,
+            limit + 0.125,
+            -limit - 0.125,
+            10.0,
+            7.0,
+            4.0,
+            2.0,
+            100.0,
+            -100.0,
+        ],
+        dtype=dtype,
+    )
+    cpu_input = torch.cat((gate, up)).unsqueeze(0)
+    x = cpu_input.to("npu")
+    # Kernel arithmetic is FP32 with one final cast; avoid a low-precision
+    # reference that rounds between SiLU, clamp and multiplication.
+    expected = _swiglustep_reference(cpu_input.float(), limit=limit).to(dtype)
+    actual = swiglustep_forward_triton(x, limit=limit).cpu()
+    rtol, atol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(x.cpu(), cpu_input, rtol=0, atol=0)
+    assert actual[0, -1].item() == -(limit * limit)
+
+
 @torch.inference_mode()
 def test_swiglustep_triton_handles_non_contiguous_input():
     """the wrapper must contiguous() a strided view before launching."""

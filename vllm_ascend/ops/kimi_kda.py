@@ -12,7 +12,6 @@ from functools import wraps
 import torch
 import torch_npu
 from einops import rearrange
-from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
@@ -25,7 +24,6 @@ from vllm.models.kimi_k3.nvidia.kda import (
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
@@ -36,6 +34,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBackend
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
+from vllm_ascend.ops.kda_conv import pack_kda_conv_weights, run_causal_conv1d
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicLinearMethod,
 )
@@ -393,35 +392,16 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         cache_indices = _normalize_causal_cache_indices(cache_indices)
-        if run_mode == 0:
-            return causal_conv1d_fn(
-                mixed_qkv,
-                conv_weights_t,
-                None,
-                conv_states=conv_state,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
-                has_initial_state=initial_state_mode,
-                activation="silu",
-                pad_slot_id=PAD_SLOT_ID,
-                null_block_id=0,
-            )
-        if run_mode != 1:
-            raise ValueError(f"Unsupported causal_conv1d run_mode: {run_mode}")
-
-        output = torch.empty_like(mixed_qkv)
-        return causal_conv1d_update(
+        return run_causal_conv1d(
             mixed_qkv,
-            conv_state,
             conv_weights_t,
-            bias=None,
-            activation="silu",
-            conv_state_indices=cache_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            query_start_loc=query_start_loc,
+            conv_state,
+            query_start_loc,
+            cache_indices,
+            initial_state_mode,
+            run_mode=run_mode,
             max_query_len=max_query_len,
-            null_block_id=0,
-            out=output,
+            num_accepted_tokens=num_accepted_tokens,
         )
 
     @torch.no_grad()
@@ -429,11 +409,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         if self.conv1d.weight.is_meta:
             return
         packed_param = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
-        packed_weight = (
-            self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            .transpose(0, 1)
-            .to(device=packed_param.device, dtype=packed_param.dtype)
-            .contiguous()
+        packed_weight = pack_kda_conv_weights(
+            (self.conv1d.weight,),
+            device=packed_param.device,
+            dtype=packed_param.dtype,
         )
         replace_parameter(
             self,

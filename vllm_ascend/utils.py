@@ -986,7 +986,10 @@ def _register_ascend_bailing_v3_kda(vllm_config: VllmConfig) -> None:
             raise RuntimeError(
                 "Ling V3 on Ascend requires a vLLM build containing vllm.model_executor.models.bailing_moe_v3."
             ) from exc
+        from vllm_ascend.ops.bailing_rotary_embedding import AscendBailingMRotaryEmbedding
+
         REGISTERED_ASCEND_OPS["BailingMoeV3KimiDeltaAttention"] = AscendBailingMoeV3KimiDeltaAttention
+        REGISTERED_ASCEND_OPS["BailingMRotaryEmbedding"] = AscendBailingMRotaryEmbedding
         return
 
 
