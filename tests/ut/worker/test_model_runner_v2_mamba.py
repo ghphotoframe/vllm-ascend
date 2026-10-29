@@ -330,6 +330,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
         ),
         num_accepted_tokens_gpu=torch.tensor([2, 3], dtype=torch.int32),
         max_model_len=1024,
+        get_attn_rotary_positions=lambda _: None,
     )
     input_batch = SimpleNamespace(
         num_reqs=2,

@@ -80,7 +80,9 @@ def _unified_apply_activation(
             swiglu_beta=mlp_compute_input.swiglu_beta,
         )
     elif activation == MoEActivation.SWIGLUSTEP:
-        hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=7.0)
+        swiglu_limit = mlp_compute_input.swiglu_limit
+        limit = swiglu_limit if swiglu_limit is not None else 7.0
+        hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=limit)
     elif activation == MoEActivation.GELU:
         gate, up = hidden_states.chunk(2, dim=-1)
         hidden_states = torch.nn.functional.gelu(gate) * up
