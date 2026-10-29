@@ -4,7 +4,6 @@
 
 import torch
 from einops import rearrange
-from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
@@ -14,13 +13,13 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
-from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
-from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state
+from vllm_ascend.ops.kda_conv import native_conv_state_supported, pack_kda_conv_weights, run_causal_conv1d
+from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state, gather_update_conv_state
 
 _KDA_MAX_RECURRENT_TOKENS = 8
+_PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 
 
 def _zero_padded_spec_output(output: torch.Tensor, query_start_loc: torch.Tensor) -> torch.Tensor:
@@ -34,13 +33,11 @@ def _zero_padded_spec_output(output: torch.Tensor, query_start_loc: torch.Tensor
 class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
     """Run Bailing/Ling V3 KDA with the current Ascend GDN metadata and ops."""
 
+    # Worker startup prepares this layer after KV-cache binding on every device.
+    _requires_kda_state_copy = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Only A5 needs the Kimi worker-prepared copy plan for padded pages.
-        # Preserve the existing A2/A3 prefill path and its kernel launches.
-        self._requires_kda_state_copy = (
-            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
-        )
         self._ascend_kda_state_copy = None
         # The device kernel skips sequences longer than MAX_MTP without a
         # host-side error, so reject an unsupported verification width here.
@@ -50,6 +47,20 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 f"{_KDA_MAX_RECURRENT_TOKENS - 1} speculative tokens, got {self.num_speculative_tokens}."
             )
         self._conv_state_dim_first = is_conv_state_dim_first()
+        # Derived kernel storage is not a checkpoint parameter. A persistent
+        # parameter here would fail the unquantized loader's strict tracking.
+        self.register_buffer(
+            _PACKED_CONV_WEIGHT_NAME,
+            torch.empty(
+                self.conv_size,
+                3 * self.projection_size_per_partition,
+                dtype=self.model_config.dtype if self.model_config is not None else torch.get_default_dtype(),
+                device=self.q_conv1d.weight.device,
+            ),
+            persistent=False,
+        )
+        self._ascend_conv_weights_ready = False
+        self._ascend_conv_weights_initialized = False
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendGDNAttentionBackend
@@ -100,12 +111,44 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
 
+    @torch.no_grad()
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # AttentionLayerBase's deferred post-load runs after all three child
+        # convs. During RL reload it also restores this parent's original
+        # storage before packing, regardless of the checkpoint loading order.
+        self._ascend_conv_weights_ready = False
+        parent_postload = getattr(super(), "process_weights_after_loading", None)
+        if parent_postload is not None:
+            parent_postload(act_dtype)
+        packed = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)
+        if packed.is_meta or packed.dtype != act_dtype:
+            raise RuntimeError("Bailing KDA packed conv storage must be materialized in the model activation dtype.")
+        weights = [conv.weight for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)]
+        if any(weight.is_meta for weight in weights):
+            raise RuntimeError("Bailing KDA conv weights must all be loaded before packing.")
+        expected_shape = (packed.shape[1] // 3, 1, packed.shape[0])
+        if any(weight.shape != expected_shape for weight in weights):
+            raise RuntimeError("Bailing KDA conv weight shapes cannot change after initialization.")
+        if packed.device != weights[0].device:
+            # device_loading_context moves CPU parameters, but not buffers.
+            # Follow the loaded children once, before a graph can capture this
+            # storage. Later reloads must preserve the original device/address.
+            if self._ascend_conv_weights_initialized:
+                raise RuntimeError("Bailing KDA packed conv weights cannot change device after initialization.")
+            packed = torch.empty_like(packed, device=weights[0].device)
+            self.register_buffer(_PACKED_CONV_WEIGHT_NAME, packed, persistent=False)
+        packed_weight = pack_kda_conv_weights(weights, dtype=act_dtype, device=packed.device)
+        packed.copy_(packed_weight)
+        self._ascend_conv_weights_initialized = True
+        self._ascend_conv_weights_ready = True
+
     def _conv_weights_t(self, dtype: torch.dtype) -> torch.Tensor:
-        weights = [
-            conv.weight.view(conv.weight.size(0), conv.weight.size(2))
-            for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
-        ]
-        return torch.cat(weights, dim=0).transpose(0, 1).to(dtype=dtype).contiguous()
+        packed = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)
+        if not self._ascend_conv_weights_ready or packed.is_meta:
+            raise RuntimeError("Bailing KDA conv weights must be prepared after weight loading before forward.")
+        if packed.dtype != dtype:
+            raise RuntimeError("Bailing KDA conv weights and activations must have the same dtype.")
+        return packed
 
     def _run_causal_conv1d(
         self,
@@ -135,7 +178,28 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         kernel_state = conv_state
         kernel_indices = cache_indices
         null_block_id = NULL_BLOCK_ID
-        copy_state_back = not conv_state.is_contiguous() or conv_state.dtype != mixed_qkv.dtype
+        copy_state_back = not native_conv_state_supported(conv_state, mixed_qkv.dtype)
+        state_len, state_dim = conv_state.shape[1:]
+        sd_layout = conv_state.stride(2) == 1 and conv_state.stride(1) >= state_dim
+        ds_layout = conv_state.stride(1) == 1 and conv_state.stride(2) >= state_len
+        row_span = (state_len - 1) * conv_state.stride(1) + (state_dim - 1) * conv_state.stride(2) + 1
+        update_state_during_gather = (
+            copy_state_back
+            and run_mode == 1
+            and max_query_len == 1
+            and num_accepted_tokens is None
+            and self.num_speculative_tokens == 0
+            and conv_weights_t.shape[0] == 4
+            and 3 <= conv_state.shape[1] <= 32
+            # FLA switches to compact varlen addressing when these differ.
+            and mixed_qkv.ndim == 2
+            and mixed_qkv.shape[0] == cache_indices.shape[0]
+            and mixed_qkv.dtype == torch.bfloat16
+            and mixed_qkv.stride(1) == 1
+            and conv_state.dtype in (torch.float32, torch.bfloat16)
+            and (sd_layout or ds_layout)
+            and conv_state.stride(0) >= row_span
+        )
         if copy_state_back:
             # Pack only this batch's rows. The copy kernel handles DS/page
             # strides and casts on load/store without copying the cache pool.
@@ -145,45 +209,57 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 device=conv_state.device,
             )
             kernel_indices = torch.empty_like(cache_indices, dtype=torch.int32)
-            cache_indices = torch.where(cache_indices == NULL_BLOCK_ID, PAD_SLOT_ID, cache_indices)
-            copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=False)
             # Packed row zero is valid. FLA only enables null-block filtering
             # for nonnegative IDs, so reserve the ID just past the packed rows.
             null_block_id = kernel_state.shape[0]
+            if update_state_during_gather:
+                # Keep native convolution arithmetic, but commit its single-token
+                # history update while gathering the old BF16 state. No scatter
+                # is needed after the native op mutates its temporary packed rows.
+                gather_update_conv_state(
+                    conv_state,
+                    kernel_state,
+                    mixed_qkv,
+                    cache_indices,
+                    query_start_loc,
+                    kernel_indices,
+                    null_block_id=NULL_BLOCK_ID,
+                )
+            else:
+                cache_indices = torch.where(cache_indices == NULL_BLOCK_ID, PAD_SLOT_ID, cache_indices)
+                copy_conv_state(
+                    conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=False
+                )
 
-        # Unlike prefill, FLA update has no pad_slot_id argument. Route padding
-        # through its null-block filter for both packed and direct state views.
-        kernel_indices = torch.where(kernel_indices == PAD_SLOT_ID, null_block_id, kernel_indices)
-
-        if run_mode == 0:
-            output = causal_conv1d_fn(
-                mixed_qkv,
-                conv_weights_t,
-                None,
-                conv_states=kernel_state,
-                query_start_loc=query_start_loc,
-                cache_indices=kernel_indices,
-                has_initial_state=initial_state_mode,
-                activation="silu",
-                pad_slot_id=PAD_SLOT_ID,
-                null_block_id=null_block_id,
+        if not copy_state_back:
+            # Native fixed-row decode does not check query lengths or cache
+            # bounds. Keep the staging path's inactive-row semantics when
+            # passing a same-dtype SD cache (including physical page gaps).
+            active = (
+                (cache_indices > NULL_BLOCK_ID)
+                & (cache_indices < conv_state.shape[0])
+                & (query_start_loc[1:] > query_start_loc[:-1])
             )
-        else:
-            output = causal_conv1d_update(
-                mixed_qkv,
-                kernel_state,
-                conv_weights_t,
-                bias=None,
-                activation="silu",
-                conv_state_indices=kernel_indices,
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=query_start_loc,
-                max_query_len=max_query_len,
-                null_block_id=null_block_id,
-                out=torch.zeros_like(mixed_qkv),
-            )
+            kernel_indices = torch.where(active, cache_indices, null_block_id)
+        elif not update_state_during_gather:
+            # FLA update has no pad_slot_id argument.
+            kernel_indices = torch.where(kernel_indices == PAD_SLOT_ID, null_block_id, kernel_indices)
 
-        if copy_state_back:
+        output = run_causal_conv1d(
+            mixed_qkv,
+            conv_weights_t,
+            kernel_state,
+            query_start_loc,
+            kernel_indices,
+            initial_state_mode,
+            run_mode=run_mode,
+            max_query_len=max_query_len,
+            num_accepted_tokens=num_accepted_tokens,
+            null_block_id=null_block_id,
+            out=torch.zeros_like(mixed_qkv) if run_mode == 1 else None,
+        )
+
+        if copy_state_back and not update_state_during_gather:
             copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=True)
         return output
 
@@ -239,16 +315,13 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             state_indices = state_indices[keep]
             has_initial_state = has_initial_state[keep]
 
-        if self._requires_kda_state_copy:
-            # A5 hybrid pages pad the state row stride. Gather only selected
-            # rows and clear fresh rows without copying the cache pool.
-            state_copy = getattr(self, "_ascend_kda_state_copy", None)
-            if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
-                raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
-            initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state)
-        else:
-            initial_state = recurrent_state[state_indices].contiguous()
-            clear_ssm_states(initial_state, has_initial_state)
+        # Hybrid pages can pad the state row stride on A3 as well as A5.
+        # The worker selects the shared fused or byte-copy plan; both gather
+        # only selected rows without materializing the whole state pool.
+        state_copy = getattr(self, "_ascend_kda_state_copy", None)
+        if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
+            raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
+        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state)
         output, final_state = run_chunk_kda(
             q,
             k,
@@ -262,10 +335,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             self.dt_bias,
             lower_bound=self.lower_bound if self.safe_gate else None,
         )
-        if self._requires_kda_state_copy:
-            state_copy.scatter(recurrent_state, final_state, state_indices)
-        else:
-            recurrent_state[state_indices] = final_state.to(recurrent_state.dtype)
+        state_copy.scatter(recurrent_state, final_state, state_indices)
         return output
 
     @eager_break_during_capture

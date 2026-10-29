@@ -68,6 +68,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -382,6 +383,7 @@ def build_attn_metadata(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
+    rotary_positions: torch.Tensor | None = None,
     attn_state: Any | None = None,
     graph_pad_size: int = -1,
     num_actual_tokens: int | None = None,
@@ -539,6 +541,14 @@ def build_attn_metadata(
             is_v41_builder = isinstance(attn_metadata_builder, AscendDSAV41MetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
             metadata_variants = [(attn_group.layer_names, common_attn_metadata)]
+            if (
+                rotary_positions is not None
+                and isinstance(attn_metadata_builder, AscendMLAMetadataBuilder)
+                and attn_metadata_builder.bailing_rotary_emb is not None
+            ):
+                rotary_common = copy(common_attn_metadata)
+                rotary_common.positions = rotary_positions
+                metadata_variants = [(attn_group.layer_names, rotary_common)]
             if is_sfa_builder and draft_layer_names:
                 target_names = [name for name in attn_group.layer_names if name not in draft_layer_names]
                 draft_names = [name for name in attn_group.layer_names if name in draft_layer_names]
@@ -1938,7 +1948,15 @@ def build_attn_metadata_wrapper():
 
 @contextmanager
 def build_attn_metadata_factory(
-    positions, pad, is_prefilling, seq_lens_cpu=None, *, attn_state=None, parallel_config=None, offload_kwargs=None
+    positions,
+    pad,
+    is_prefilling,
+    seq_lens_cpu=None,
+    *,
+    attn_state=None,
+    parallel_config=None,
+    offload_kwargs=None,
+    rotary_positions=None,
 ):
     """Wrap build_attn_metadata with Ascend draft-model context.
 
@@ -1952,6 +1970,8 @@ def build_attn_metadata_factory(
 
     def build_attn_metadata(*args, **kwargs):
         kwargs["positions"] = positions[:pad]
+        if rotary_positions is not None:
+            kwargs["rotary_positions"] = rotary_positions[..., :pad]
         kwargs["is_prefilling"] = is_prefilling
         kwargs["attn_state"] = attn_state
         kwargs["parallel_config"] = parallel_config

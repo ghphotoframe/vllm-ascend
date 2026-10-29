@@ -350,6 +350,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             parallel_config=self.vllm_config.parallel_config,
             seq_lens_np=input_batch.seq_lens_np,
             positions=input_batch.positions,
+            rotary_positions=self.get_attn_rotary_positions(num_tokens),
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             for_cudagraph_capture=for_capture,

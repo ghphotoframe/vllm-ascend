@@ -46,7 +46,12 @@ def test_register_customop_selects_stateful_ops_before_import(device_type):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if name in ("vllm_ascend.ops.bailing_moe_v3_kda", "vllm.model_executor.models.bailing_moe_v3"):
+        if name in (
+            "vllm_ascend.ops.bailing_moe_v3_kda",
+            "vllm.model_executor.models.bailing_moe_v3",
+            "vllm_ascend.ops.bailing_rotary_embedding",
+            "vllm.model_executor.layers.rotary_embedding.bailing_mrope",
+        ):
             raise AssertionError(f"Ling FLA dependencies must wait for worker device selection: {name}")
         if device_type == AscendDeviceType._310P and (
             name in ("vllm_ascend.ops.gdn", "vllm_ascend.ops.bailing_moe_v3_kda", "vllm_ascend.ops.kda", "fla_npu")
@@ -101,12 +106,15 @@ def test_deferred_bailing_registration_selects_target_or_draft_architecture(mode
     operator = type("AscendBailingMoeV3KimiDeltaAttention", (), {})
     module = ModuleType("vllm_ascend.ops.bailing_moe_v3_kda")
     module.AscendBailingMoeV3KimiDeltaAttention = operator
+    rotary_module = ModuleType("vllm_ascend.ops.bailing_rotary_embedding")
+    rotary_operator = type("AscendBailingMRotaryEmbedding", (), {})
+    rotary_module.AscendBailingMRotaryEmbedding = rotary_operator
     config = SimpleNamespace(
         model_config=None if is_draft else model_config,
         speculative_config=SimpleNamespace(draft_model_config=model_config) if is_draft else None,
     )
     with (
-        mock.patch.dict(sys.modules, {module.__name__: module}),
+        mock.patch.dict(sys.modules, {module.__name__: module, rotary_module.__name__: rotary_module}),
         mock.patch.object(utils, "REGISTERED_ASCEND_OPS", {}),
         mock.patch.object(
             utils, "get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A3)
@@ -114,6 +122,7 @@ def test_deferred_bailing_registration_selects_target_or_draft_architecture(mode
     ):
         utils._register_ascend_bailing_v3_kda(config)
         assert (utils.REGISTERED_ASCEND_OPS.get("BailingMoeV3KimiDeltaAttention") is operator) is expected
+        assert (utils.REGISTERED_ASCEND_OPS.get("BailingMRotaryEmbedding") is rotary_operator) is expected
 
 
 @pytest.mark.parametrize(
@@ -160,10 +169,12 @@ def test_deferred_bailing_registration_preserves_class_identity_across_workers()
         with ThreadPoolExecutor(max_workers=4) as pool:
             rms_classes = list(pool.map(lambda _: utils.register_ascend_fla_customop(config), range(8)))
         from vllm_ascend.ops.bailing_moe_v3_kda import AscendBailingMoeV3KimiDeltaAttention
+        from vllm_ascend.ops.bailing_rotary_embedding import AscendBailingMRotaryEmbedding
 
         assert all(cls is rms_classes[0] for cls in rms_classes)
         assert op_registry_oot["BailingMoeV3KimiDeltaAttention"] is AscendBailingMoeV3KimiDeltaAttention
         assert utils.REGISTERED_ASCEND_OPS["BailingMoeV3KimiDeltaAttention"] is AscendBailingMoeV3KimiDeltaAttention
+        assert op_registry_oot["BailingMRotaryEmbedding"] is AscendBailingMRotaryEmbedding
 
 
 def test_cp_decode_stream_is_cached_and_separate_from_chunked_prefill():

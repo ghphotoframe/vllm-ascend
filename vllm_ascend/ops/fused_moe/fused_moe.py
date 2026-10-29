@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
@@ -168,8 +169,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         """Mirror of upstream ``MoERunner.forward`` (this class is instantiated
         through the OOT PluggableLayer dispatch of ``MoERunner``).
 
-        Latent W4A8 SP shared experts use a plain tensor Add after the
-        routed-output transform. Other paths retain the foreach combine.
+        Use a plain tensor Add for the single shared+routed output pair.
+        Superkernel retains foreach for graph connectivity, except for the
+        existing latent W4A8 SP release schedule.
         The runtime-aware reduction hooks (#16550) are unchanged.
         """
         # Apply transform for routed experts (e.g., latent projection for
@@ -233,7 +235,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            if getattr(self, "_release_shared_schedule", False):
+            # #16245 requires foreach inside superkernel. Ordinary ACL graphs
+            # can use the cheaper single-pair Add without changing either input.
+            if (
+                getattr(self, "_release_shared_schedule", False)
+                or not get_ascend_config().ascend_compilation_config.enable_super_kernel
+            ):
                 result = shared_output + fused_output
             else:
                 result = torch._foreach_add([shared_output], [fused_output])[0]

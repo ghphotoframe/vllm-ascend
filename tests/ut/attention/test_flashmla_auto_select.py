@@ -78,6 +78,7 @@ def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypat
         dtype=torch.bfloat16,
         enable_kv_nz=False,
         pcp_enabled=False,
+        rotary_emb=None,
     )
     monkeypatch.setattr(
         mla_v1,
@@ -89,6 +90,9 @@ def test_flashmla_selection_requires_operator_and_supported_mla_config(monkeypat
     monkeypatch.setattr(mla_v1, "get_flashmla_ops", lambda: (lambda: None, lambda: None))
 
     assert AscendMLAImpl._can_use_flashmla(impl)
+    impl.rotary_emb = SimpleNamespace(uses_mla_mrope=True)
+    assert not AscendMLAImpl._can_use_flashmla(impl)
+    impl.rotary_emb = None
 
     monkeypatch.setattr(mla_v1, "get_flashmla_ops", lambda: None)
     assert not AscendMLAImpl._can_use_flashmla(impl)

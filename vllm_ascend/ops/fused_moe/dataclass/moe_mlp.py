@@ -73,6 +73,11 @@ def build_mlp_compute_input(
 
     expanded_row_idx = getattr(token_dispatch_output.combine_metadata, "expanded_row_idx", None)
     activation = fused_experts_input.activation
+    # Communication objects are shared by expert shape and may hold a later
+    # layer's config. Activation parameters belong to the routed layer.
+    layer_config = getattr(fused_experts_input.layer, "moe_config", None)
+    if layer_config is not None:
+        moe_config = layer_config
     activation_situ_beta = None if moe_config is None else moe_config.activation_situ_beta
     activation_situ_linear_beta = None if moe_config is None else moe_config.activation_situ_linear_beta
     # Prefer the per-layer swiglu params threaded through the fused-experts

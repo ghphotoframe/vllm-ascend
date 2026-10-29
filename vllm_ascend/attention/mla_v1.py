@@ -70,7 +70,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, supports_component_major_mla_pd
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device.paged_mla_cache_read import load_mla_cache_rows_by_slots
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
@@ -280,6 +280,18 @@ class AscendMLAMetadata:
 M = TypeVar("M", bound=AscendMLAMetadata)
 
 
+def _get_bailing_rotary_embedding(vllm_config, layer_names):
+    """Bind frequencies to this attention group, independently of ViT RoPE."""
+    layers = vllm_config.compilation_config.static_forward_context
+    rotary_embeddings = [getattr(layers[name].impl, "rotary_emb", None) for name in layer_names]
+    if not any(getattr(rope, "uses_mla_mrope", False) is True for rope in rotary_embeddings):
+        return None
+    first = rotary_embeddings[0]
+    if any(rope is not first for rope in rotary_embeddings):
+        raise ValueError("Bailing MLA layers in one attention group must share their rotary embedding")
+    return first
+
+
 class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -341,6 +353,18 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.use_mla_rope = static_forward_context[layer_names[0]].impl.use_mla_rope if layer_names else True
         self.cos_cache = None
         self.sin_cache = None
+        self.bailing_rotary_emb = _get_bailing_rotary_embedding(vllm_config, layer_names)
+        if self.bailing_rotary_emb is not None:
+            if self.pcp_enabled:
+                raise NotImplementedError("Bailing MLA M-RoPE currently requires prefill_context_parallel_size=1")
+            if self.bailing_rotary_emb.rotary_dim != self.rope_dim:
+                raise ValueError("Bailing MLA rotary dimension must match qk_rope_head_dim")
+            cache = self.bailing_rotary_emb.cos_sin_cache
+            shape = (scheduler_config.max_num_batched_tokens, 1, 1, self.rope_dim)
+            # Metadata is refreshed outside FULL graph replay. These buffers
+            # preserve the addresses consumed by every captured MLA layer.
+            self.cos_cache = torch.empty(shape, dtype=cache.dtype, device=device)
+            self.sin_cache = torch.empty_like(self.cos_cache)
 
         self.chunk_seq_lens: torch.Tensor = None
         self.cu_seq_lens_cpu: torch.Tensor = None
@@ -668,7 +692,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             if self.is_pcp_decode_sharded:
                 # Decode rows lead the local positions, so a decode-only batch
                 # can refresh the graph-stable RoPE buffer that decode uses.
-                metadata.pcp_cos, metadata.pcp_sin = get_cos_and_sin_mla(
+                metadata.pcp_cos, metadata.pcp_sin = self._get_cos_and_sin(
                     common_attn_metadata.positions.long(), use_cache=self.num_prefills == 0
                 )
         return metadata
@@ -772,6 +796,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             return common_attn_metadata.num_reqs
         return self.num_decodes
 
+    def _get_cos_and_sin(self, positions: torch.Tensor, use_cache: bool = False):
+        if self.bailing_rotary_emb is not None:
+            output_cache = (self.cos_cache, self.sin_cache) if use_cache else None
+            return self.bailing_rotary_emb.select_cos_sin_mla(positions, output_cache)
+        return get_cos_and_sin_mla(positions, use_cache=use_cache)
+
     def build_prefill_metadata(
         self,
         common_prefix_len: int,
@@ -791,9 +821,9 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         max_seq_lens = self.seq_lens[reqs_start:].max().item()
         prefill_query_start_loc = query_start_loc[reqs_start:] - query_start_loc[reqs_start]
 
-        prefill_input_positions = input_positions[tokens_start:]
+        prefill_input_positions = input_positions[..., tokens_start:]
         if self.use_mla_rope:
-            cos, sin = get_cos_and_sin_mla(prefill_input_positions)
+            cos, sin = self._get_cos_and_sin(prefill_input_positions)
         else:
             cos = sin = None
         prefill_query_lens = self.query_lens[reqs_start:].to(torch.int32)
@@ -822,13 +852,13 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
-        input_positions = common_attn_metadata.positions[: self.num_actual_tokens].long()
+        input_positions = common_attn_metadata.positions[..., : self.num_actual_tokens].long()
 
         # Notice that num_decodes != num_decode_tokens in SpecDecoding Scenario
         actual_seq_lengths_q = query_start_loc_cpu[1 : self.num_decodes + 1].tolist()
         max_seq_lens = self.seq_lens[: self.num_decodes].max().item()
         self.seq_lens = self.seq_lens[: self.num_decodes]
-        input_positions = input_positions[: self.num_decode_tokens]
+        input_positions = input_positions[..., : self.num_decode_tokens]
 
         block_table_size = self.get_block_table_size(common_attn_metadata, BUILD_METADATA_STEP_DECODE)
         self.block_table = self.block_table[:block_table_size]
@@ -872,15 +902,17 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 )
                 self.block_table = torch.cat([self.block_table, block_table_padding], dim=0)
                 position_padding = torch.zeros(
-                    num_token_pad_size, dtype=input_positions.dtype, device=input_positions.device
+                    (*input_positions.shape[:-1], num_token_pad_size),
+                    dtype=input_positions.dtype,
+                    device=input_positions.device,
                 )
-                input_positions = torch.cat([input_positions, position_padding])
+                input_positions = torch.cat([input_positions, position_padding], dim=-1)
                 actual_seq_lengths_q = self.pad_actual_seq_len_q_mtp_enable_pad(
                     num_reqs_pad_size, num_reqs, actual_seq_lengths_q, common_attn_metadata
                 )
 
         if self.use_mla_rope:
-            cos, sin = get_cos_and_sin_mla(input_positions, use_cache=True)
+            cos, sin = self._get_cos_and_sin(input_positions, use_cache=True)
             cos = cos[: self.num_decode_tokens, ...]
             sin = sin[: self.num_decode_tokens, ...]
         else:
@@ -1059,6 +1091,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         self._flashmla_writer_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def _can_use_flashmla(self) -> bool:
+        # FlashMLA currently selects frequencies from absolute 1D positions.
+        if getattr(self.rotary_emb, "uses_mla_mrope", False) is True:
+            return False
         config = self.vllm_config
         if not getattr(config, "use_v2_model_runner", False):
             return False
@@ -1989,11 +2024,28 @@ class AscendMLAImpl(MLAAttentionImpl):
         return 0 < block_size <= MLAPO_MAX_CACHE_BLOCK_SIZE and block_size % MLAPO_CACHE_BLOCK_ALIGNMENT == 0
 
     def _uses_strided_kv_adapter(self) -> bool:
-        """A5 drafts with unsupported He retain their strided cache via scatter.
+        """Stage current KV rows when a strided pool cannot use fused ProLog.
 
-        Keep CP and non-A5 admission unchanged. A5 scatter supports the
-        token-fused views as well as caches with only a padded block stride.
+        Ling VL can have a direct Q projection (q_lora_rank=None), outside
+        PROLOG_V3's compressed-query contract. Its BF16 KV normalization and
+        RoPE still use the shared bounded writer followed by cache scatter.
+        Never pass its padded hybrid pool to KvRmsNormRopeCache, whose
+        AutoContiguous cache arguments materialize the entire pool.
         """
+        if (
+            getattr(getattr(self, "rotary_emb", None), "uses_mla_mrope", False) is True
+            and self.use_mla_rope
+            and self.qk_rope_head_dim > 0
+            and self.dtype == torch.bfloat16
+            and self.kv_a_layernorm is not None
+            and self.num_kv_heads == 1
+            and not self.fa_quant_layer
+            and not self.enable_kv_nz
+            and not self.pcp_enabled
+            and not self.dcp_enabled
+        ):
+            return True
+        # Preserve the existing A5 wide-draft admission for other models.
         input_size = getattr(getattr(self, "fused_qkv_a_proj", None), "input_size", None)
         return (
             isinstance(input_size, int)
@@ -2016,14 +2068,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         """Allocate during weight loading, before KV sizing, and retain graph addresses."""
         if not self._uses_strided_kv_adapter() or getattr(self, "_strided_kv_workspace", None) is not None:
             return
-        assert self.fused_qkv_a_proj is not None
+        assert self.kv_a_layernorm is not None
         capacity = max(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             max(self.vllm_config.compilation_config.cudagraph_capture_sizes or [0]),
         )
         block_size = self.vllm_config.cache_config.block_size
         shape = (cdiv(capacity, block_size), block_size, self.num_kv_heads)
-        device = self.fused_qkv_a_proj.weight.device
+        device = self.kv_a_layernorm.weight.device
         self._strided_kv_workspace = (
             torch.empty((*shape, self.kv_lora_rank), dtype=self.dtype, device=device),
             torch.empty((*shape, self.qk_rope_head_dim), dtype=self.dtype, device=device),
@@ -2042,6 +2094,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         if num_tokens == 0:
             return rope.flatten(0, 1)[:0], nope.flatten(0, 1)[:0]
         self._validate_prolog_v3_cache(kv_cache)
+        if (
+            getattr(getattr(self, "rotary_emb", None), "uses_mla_mrope", False) is True
+            and get_current_hardware_profile().device_adaptor_family != DeviceAdaptorFamily.FP8_OPTIMIZED
+            and any(cache.stride(1) != cache.shape[2] * cache.shape[3] for cache in kv_cache)
+        ):
+            # The standard scatter supports padded pages with dense token rows,
+            # but not A5's token-fused NoPE/RoPE slices. Fail before either write.
+            raise RuntimeError("Bailing MLA KV scatter requires component-major caches on this device.")
         assert self.kv_a_layernorm is not None
         blocks = cdiv(num_tokens, nope.shape[1])
         torch_npu.npu_kv_rmsnorm_rope_cache(

@@ -19,6 +19,7 @@ import vllm_ascend.attention.mla_v1 as mla_v1
 from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl
 from vllm_ascend.attention.mla_v1 import AscendMLAImpl
 from vllm_ascend.attention.utils import supports_strided_mla_cache
+from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 from vllm_ascend.model_executor.offloader.prefetch import AscendPrefetchOffloader
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
@@ -1365,6 +1366,41 @@ def _make_wide_draft_impl():
     return impl
 
 
+def _make_mrope_direct_q_impl():
+    impl = _make_wide_draft_impl()
+    impl.rotary_emb = SimpleNamespace(uses_mla_mrope=True)
+    impl.fused_qkv_a_proj = None
+    impl.q_lora_rank = None
+    impl.q_a_layernorm = None
+    impl.support_fp8_attention = False
+    impl.is_draft_model = False
+    return impl
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("pcp_enabled", True),
+        ("dcp_enabled", True),
+        ("enable_kv_nz", True),
+        ("fa_quant_layer", True),
+        ("use_mla_rope", False),
+        ("dtype", torch.float16),
+        ("num_kv_heads", 2),
+        ("qk_rope_head_dim", 0),
+        ("rotary_emb", None),
+    ],
+)
+def test_mrope_direct_q_adapter_preserves_other_writer_contracts(attribute, value):
+    impl = _make_mrope_direct_q_impl()
+    assert impl._uses_strided_kv_adapter()
+    assert not impl.supports_prolog_v3_writer()
+    setattr(impl, attribute, value)
+    impl._prepare_strided_kv_workspace()
+    assert not impl._uses_strided_kv_adapter()
+    assert impl._strided_kv_workspace is None
+
+
 @pytest.mark.parametrize("input_size", [7168, 8192, 14336, None])
 def test_prolog_writer_checks_projection_input_instead_of_model_hidden_size(input_size):
     impl = _make_wide_draft_impl()
@@ -1392,8 +1428,9 @@ def test_wide_draft_adapter_does_not_expand_hardware_or_dtype_support(attribute,
     assert impl._strided_kv_workspace is None
 
 
-def test_wide_draft_workspace_is_bounded_prepared_and_stable_across_reload():
-    impl = _make_wide_draft_impl()
+@pytest.mark.parametrize("impl_factory", [_make_wide_draft_impl, _make_mrope_direct_q_impl])
+def test_wide_draft_workspace_is_bounded_prepared_and_stable_across_reload(impl_factory):
+    impl = impl_factory()
     assert not impl.supports_strided_mla_writer()
     impl._prepare_strided_kv_workspace()
     assert impl.supports_strided_mla_writer()
@@ -1407,8 +1444,9 @@ def test_wide_draft_workspace_is_bounded_prepared_and_stable_across_reload():
     assert impl._strided_kv_workspace is workspace
 
 
-def test_wide_draft_weight_loading_prepares_workspace_without_prolog_weights():
-    impl = _make_wide_draft_impl()
+@pytest.mark.parametrize("impl_factory", [_make_wide_draft_impl, _make_mrope_direct_q_impl])
+def test_wide_draft_weight_loading_prepares_workspace_without_prolog_weights(impl_factory):
+    impl = impl_factory()
     impl.enable_mlapo = False
     impl._prolog_v3_weights = None
     impl.kv_b_proj = SimpleNamespace(
@@ -1431,8 +1469,9 @@ def test_wide_draft_weight_loading_prepares_workspace_without_prolog_weights():
 
 @pytest.mark.parametrize("cache_factory", [_component_major_cache, _token_fused_cache])
 @pytest.mark.parametrize("prefill", [False, True])
-def test_wide_draft_adapter_writes_original_storage_and_skips_padding(cache_factory, prefill):
-    impl = _make_wide_draft_impl()
+@pytest.mark.parametrize("impl_factory", [_make_wide_draft_impl, _make_mrope_direct_q_impl])
+def test_wide_draft_adapter_writes_original_storage_and_skips_padding(cache_factory, prefill, impl_factory):
+    impl = impl_factory()
     impl._prepare_strided_kv_workspace()
     cache = cache_factory()
     base = torch.empty(0, dtype=cache[0].dtype).set_(
@@ -1476,6 +1515,17 @@ def test_wide_draft_adapter_writes_original_storage_and_skips_padding(cache_fact
         patch("torch_npu.npu_kv_rmsnorm_rope_cache", side_effect=normalize_into_temporary),
         patch("torch_npu.npu_mla_prolog_v3") as prolog,
         patch.object(mla_v1.DeviceOperator, "reshape_and_cache", side_effect=scatter),
+        patch.object(
+            mla_v1,
+            "get_current_hardware_profile",
+            return_value=SimpleNamespace(
+                device_adaptor_family=(
+                    DeviceAdaptorFamily.STANDARD
+                    if cache_factory is _component_major_cache
+                    else DeviceAdaptorFamily.FP8_OPTIMIZED
+                )
+            ),
+        ),
     ):
         if prefill:
             rope, nope = impl.exec_kv_prefill(kv, cos, sin, cache, slots)
@@ -1490,8 +1540,36 @@ def test_wide_draft_adapter_writes_original_storage_and_skips_padding(cache_fact
     torch.testing.assert_close(base, expected)
 
 
-def test_wide_draft_workspace_never_grows_during_forward():
-    impl = _make_wide_draft_impl()
+@pytest.mark.parametrize("prefill", [False, True])
+def test_mrope_standard_scatter_rejects_token_fused_cache_before_writing(prefill):
+    impl = _make_mrope_direct_q_impl()
+    impl._prepare_strided_kv_workspace()
+    cache = _token_fused_cache()
+    before = tuple(component.clone() for component in cache)
+    kv = torch.randn(1, FUSED_DIM, dtype=impl.dtype)
+    with (
+        patch.object(
+            mla_v1,
+            "get_current_hardware_profile",
+            return_value=SimpleNamespace(device_adaptor_family=DeviceAdaptorFamily.STANDARD),
+        ),
+        patch("torch_npu.npu_kv_rmsnorm_rope_cache") as writer,
+        patch.object(mla_v1.DeviceOperator, "reshape_and_cache") as scatter,
+        pytest.raises(RuntimeError, match="requires component-major caches"),
+    ):
+        if prefill:
+            impl.exec_kv_prefill(kv, None, None, cache, torch.tensor([0]))
+        else:
+            impl.exec_kv_decode(kv, None, None, cache, torch.tensor([0]))
+    writer.assert_not_called()
+    scatter.assert_not_called()
+    for component, expected in zip(cache, before):
+        torch.testing.assert_close(component, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("impl_factory", [_make_wide_draft_impl, _make_mrope_direct_q_impl])
+def test_wide_draft_workspace_never_grows_during_forward(impl_factory):
+    impl = impl_factory()
     cache = _token_fused_cache()
     with pytest.raises(RuntimeError, match="prepared before KV cache sizing"):
         impl._exec_strided_kv_writer(torch.empty(1, FUSED_DIM), None, None, cache, torch.tensor([0]))

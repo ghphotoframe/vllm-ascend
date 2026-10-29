@@ -616,19 +616,17 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1, w1_scale, _, w2_scale = self._get_mlp_weights(layer)
         bias1, _ = self._get_mlp_scale_bias(layer)
         group_list, group_list_type = self._maybe_convert_group_list(mlp_compute_input)
-        scale = [w1_scale[0].to(w2_scale[0].dtype)]
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=w1 if isinstance(w1, list) else [w1],
-            scale=scale,
-            bias=bias1,
-            per_token_scale=[pertoken_scale],
-            split_item=2,
-            group_type=0,
-            group_list=group_list,
-            group_list_type=group_list_type,
+        hidden_states = self._apply_dequantized_gmm1(
+            hidden_states,
+            pertoken_scale,
+            w1,
+            w1_scale,
+            w2_scale,
+            bias1,
+            group_list,
+            group_list_type,
             output_dtype=torch.bfloat16,
-        )[0]
+        )
         dispose_tensor(mlp_compute_input.hidden_states)
         return hidden_states
 
