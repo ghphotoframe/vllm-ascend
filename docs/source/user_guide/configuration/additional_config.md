@@ -59,6 +59,8 @@ The following table lists additional configuration options available in vLLM Asc
 | `mlapo_keep_prefill_weights`        | bool | `False` | When True, keep MLAPO prefill weights on NPU instead of freeing them on kv_consumer (decode-only D) nodes. D nodes have normal local-prefill paths (recompute / fallback / preempt) that crash when the weights are freed (issue #11882). Enable this to trade NPU memory for stability. |
 | `weight_nz_mode`                    | int  | `1`     | Weight NZ mode. `0` disables NZ, `1` enables NZ only for quantized weights, and `2` also enables NZ for BF16/FP16 weights when supported. The legacy `VLLM_ASCEND_ENABLE_NZ` environment variable is no longer supported. |
 | `enable_fused_mc2`                  | int  | `0`     | Fused MC2 configuration. `0` disables the fused path, `1` selects dispatch-FFN-combine, and `2` selects CANN MegaMoe when the model and parallel configuration support it. On A5, SiTU models require a CANN MegaMoe wrapper exposing `activation` and `activation_params`; both SiTU parameters are bound from the MoE configuration during initialization. The legacy `VLLM_ASCEND_ENABLE_FUSED_MC2` environment variable is no longer supported. |
+| `enable_megamoe_weight_padding`     | bool | `False` | Enable explicitly to pad A3 BF16 MegaMoE gate/up/down weights to a 512-aligned intermediate dimension during loading (for example, 768 to 1024). Already-aligned weights retain their size without padding allocation. Has no effect when MegaMoE is disabled. Leaving this option disabled preserves the original width; unaligned A3 MegaMoE weights do not have a numerical correctness guarantee. |
+| `disable_megamoe_for_decode`        | bool | `False` | With CANN MegaMoE enabled, use staged MoE for pure decode batches. Any batch containing prefill, including a mixed batch or a one-token prefill, still uses MegaMoE. There is no token-count threshold. The initial implementation supports A3 BF16, Model Runner V2, DP1, no speculative decoding, and graph mode `NONE` or `FULL_DECODE_ONLY`. |
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. The legacy `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable is no longer supported. |
 | `enable_dsa_cp`                     | bool | `False` | Whether to enable DSA-CP for DeepSeek V3.2, DeepSeek V4, and other models with the same architecture. Supported only with Model Runner V1 and requires sequence parallelism. Enabling it automatically enables FlashComm. Setting this option to `true` with Model Runner V2 raises a configuration error; use [PCP](../feature_guide/context_parallel.md#prefill-context-parallel) instead. |
 | `enable_flashcomm1`                 | bool | `False` | Whether to enable SP MoE. See [Sequence Parallelism](../feature_guide/sequence_parallelism.md). |
@@ -70,7 +72,49 @@ The following table lists additional configuration options available in vLLM Asc
 | `rl_config`                        | dict | `{}`    | One-click RL mode configuration. See <a href="#rl_config">rl_config</a> for all fields, the two deployment modes, usage examples, and the migration guide. |
 | `combine_quant_mode`                | int  | `0`     | Fused MC2 configuration. This configuration will be passed as the `comm_quant_mode` argument for the `torch_npu.npu_moe_distribute_combine_v2` operator. Please refer to the operator documentation for the valid value range. |
 
-The details of each configuration option are as follows:
+### MegaMoE phase selection and weight padding
+
+These options are read at startup; restart the engine after changing them. They
+do not enable MegaMoE on their own. `enable_fused_mc2=0` keeps the ordinary MoE
+path regardless of either new option. The default `disable_megamoe_for_decode=false`
+keeps the existing all-phase MegaMoE behavior when MegaMoE is enabled.
+`enable_megamoe_weight_padding` defaults to `false`, including when
+`enable_fused_mc2=2`. Set it explicitly to `true` to enable weight padding.
+
+| `enable_fused_mc2` | `disable_megamoe_for_decode` | Prefill or mixed batch | Pure decode batch |
+| --- | --- | --- | --- |
+| `0` | Either | Ordinary MoE | Ordinary MoE |
+| `2` | `false` (default) | MegaMoE | MegaMoE |
+| `2` | `true` | MegaMoE | Ordinary MoE |
+
+For an A3 BF16 model with DP1, keep the existing additional options and add:
+
+```bash
+--additional-config '{"enable_cpu_binding":true,"enable_fused_mc2":2,"enable_megamoe_weight_padding":true,"disable_megamoe_for_decode":true}' \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
+
+The ordinary decode path shares the loaded expert weights with MegaMoE. With
+padding enabled, both paths compute with the padded width; selecting ordinary
+decode does not restore the original width or release the padding memory. With
+padding disabled, both retain the original width. This is a shape experiment,
+not an accuracy fix for an intermediate dimension that is not divisible by 512.
+
+The runner carries the actual request phase into MoE selection. It does not
+infer prefill from query length or from eager execution. Decode graph capture
+uses the ordinary path, and startup memory profiling covers both backends.
+Ordinary MC2 retains its own 512-token-per-rank limit; larger pure decode batches
+use the existing AllToAll path. The initial implementation rejects unsupported
+phase-switching configurations at startup rather than silently applying an
+incompatible graph or weight layout.
+
+To verify a deployment, profile a request across prefill and subsequent decode
+steps: expect MegaMoE kernels in prefill and staged dispatch/GMM/activation/combine
+in pure decode when the switch is enabled. A mixed batch uses a single backend
+for all its tokens. Compare accuracy separately from latency, and compare against
+both the all-MegaMoE configuration and the original unpadded ordinary-MoE baseline.
+
+The details of each remaining configuration option are as follows:
 
 **xlite_graph_config**
 

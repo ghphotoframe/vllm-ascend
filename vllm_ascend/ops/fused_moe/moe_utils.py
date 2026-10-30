@@ -48,6 +48,7 @@ _CANN_MEGA_MOE_QUANT_MODE_MXFP = 4
 _CANN_ACL_FLOAT8_E5M2 = 23
 _CANN_ACL_FLOAT8_E4M3FN = 24
 _CANN_ACL_FLOAT4_E2M1 = 296
+_SWIGLUSTEP_DEFAULT_LIMIT = 7.0
 
 # dict: QuantType -> (dispatch_quant_mode, dispatch_quant_out_dtype, weight_type)
 _QUANT_SETTING_MAP: dict[QuantType, tuple[int, int | None, int | None]] = {
@@ -180,11 +181,14 @@ def select_mega_moe_activation_kwargs(
     builds only expose ``activation_clamp`` for standard SwiGLU, while newer
     wrappers expose either ``activation``/``activation_params`` or direct
     alpha/beta keyword arguments. Standard SwiGLU keeps the legacy call.
+    SwiGLU-Step requires explicit activation selection: the legacy default
+    clamps before SiLU, whereas Step clamps its output.
     """
     kwargs: dict[str, object] = {"activation_clamp": activation_clamp}
     activation_name = getattr(activation, "value", activation)
     is_situ = activation_name == "situ"
-    if not is_situ and activation_name not in ("swigluoai", "swigluoai_uninterleave"):
+    is_swiglustep = activation_name == "swiglustep"
+    if not is_situ and not is_swiglustep and activation_name not in ("swigluoai", "swigluoai_uninterleave"):
         return kwargs
 
     activation_parameter_pairs = (
@@ -192,6 +196,8 @@ def select_mega_moe_activation_kwargs(
         {"glu_alpha", "glu_bias"},
         {"swiglu_alpha", "swiglu_beta"},
     )
+    if is_swiglustep:
+        activation_parameter_pairs += ({"activation", "activation_clamp"},)
     try:
         parameters = inspect.signature(mega_moe_op).parameters
         parameter_names = {
@@ -214,6 +220,7 @@ def select_mega_moe_activation_kwargs(
         )
         known_names = {
             "activation",
+            "activation_clamp",
             "activation_params",
             "glu_alpha",
             "glu_bias",
@@ -222,6 +229,18 @@ def select_mega_moe_activation_kwargs(
         }
         parameter_names.update(name for name in known_names if re.search(rf"\b{re.escape(name)}\b", signature_metadata))
 
+    if is_swiglustep:
+        if not {"activation", "activation_clamp"}.issubset(parameter_names):
+            raise RuntimeError(
+                "The installed CANN MegaMoe wrapper does not expose SwiGLU-Step activation selection and clamping. "
+                "Install a compatible cann_ops_transformer build or disable fused MC2."
+            )
+        # Match the Step default used by quant_moe. CANN's None default is
+        # unbounded; Step's clamp is a scalar, not an activation_params key.
+        return {
+            "activation": "swiglustep",
+            "activation_clamp": activation_clamp or _SWIGLUSTEP_DEFAULT_LIMIT,
+        }
     if is_situ:
         if not {"activation", "activation_params"}.issubset(parameter_names):
             raise RuntimeError(

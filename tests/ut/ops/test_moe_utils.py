@@ -121,6 +121,82 @@ class TestMegaMoeQuantSettings(unittest.TestCase):
 
 
 class TestMegaMoeActivationKwargs(unittest.TestCase):
+    def test_swiglustep_binds_activation_and_layer_limit(self):
+        def mega_moe(*args, activation="swiglu", activation_clamp=None, activation_params=None):
+            return activation, activation_clamp, activation_params
+
+        for activation in ("swiglustep", MoEActivation.SWIGLUSTEP):
+            for clamp, expected_limit in ((None, 7.0), (0.0, 7.0), (4.0, 4.0), (10.0, 10.0)):
+                with self.subTest(activation=activation, clamp=clamp):
+                    kwargs = select_mega_moe_activation_kwargs(
+                        mega_moe,
+                        activation=activation,
+                        activation_clamp=clamp,
+                        swiglu_alpha=1.702,
+                        swiglu_beta=1.0,
+                    )
+                    self.assertEqual(mega_moe(**kwargs), ("swiglustep", expected_limit, None))
+                    self.assertEqual(kwargs, {"activation": "swiglustep", "activation_clamp": expected_limit})
+
+    def test_swiglustep_does_not_require_activation_params(self):
+        def mega_moe(*, activation, activation_clamp):
+            return activation, activation_clamp
+
+        kwargs = select_mega_moe_activation_kwargs(
+            mega_moe, activation="swiglustep", activation_clamp=4.0, swiglu_alpha=1.0, swiglu_beta=0.0
+        )
+        self.assertEqual(mega_moe(**kwargs), ("swiglustep", 4.0))
+
+    def test_swiglustep_rejects_wrappers_without_explicit_activation_and_clamp(self):
+        def legacy(*, activation_clamp=None):
+            """This legacy wrapper does not support activation or activation_params."""
+
+        def oai_only(*, activation_clamp=None, glu_alpha=1.0, glu_bias=0.0, **kwargs):
+            """Unlike another API with activation and activation_params, use direct scalars."""
+
+        def no_clamp(*, activation="swiglu", activation_params=None):
+            pass
+
+        def generic(*args, **kwargs):
+            pass
+
+        for op in (legacy, oai_only, no_clamp, generic):
+            with self.subTest(op=op), self.assertRaisesRegex(RuntimeError, "does not expose SwiGLU-Step"):
+                select_mega_moe_activation_kwargs(
+                    op, activation="swiglustep", activation_clamp=4.0, swiglu_alpha=1.0, swiglu_beta=0.0
+                )
+
+    def test_swiglustep_reads_generic_wrapper_metadata(self):
+        for metadata in ("_schema", "__doc__"):
+            with self.subTest(metadata=metadata):
+
+                def mega_moe(*args, **kwargs):
+                    return kwargs
+
+                setattr(mega_moe, metadata, "mega_moe(..., str activation='swiglu', float? activation_clamp=None)")
+                kwargs = select_mega_moe_activation_kwargs(
+                    mega_moe,
+                    activation="swiglustep",
+                    activation_clamp=4.0,
+                    swiglu_alpha=1.0,
+                    swiglu_beta=0.0,
+                )
+                self.assertEqual(mega_moe(**kwargs), {"activation": "swiglustep", "activation_clamp": 4.0})
+
+    def test_swiglustep_reads_compiled_schema(self):
+        class CompiledMegaMoe:
+            __signature__ = "not inspectable"
+            _schema = "mega_moe(..., str activation='swiglu', float? activation_clamp=None)"
+
+            def __call__(self, *args, **kwargs):
+                return kwargs
+
+        op = CompiledMegaMoe()
+        kwargs = select_mega_moe_activation_kwargs(
+            op, activation="swiglustep", activation_clamp=4.0, swiglu_alpha=1.0, swiglu_beta=0.0
+        )
+        self.assertEqual(op(**kwargs), {"activation": "swiglustep", "activation_clamp": 4.0})
+
     def test_situ_preserves_both_parameters_without_swiglu_clamping(self):
         def mega_moe(*args, activation="swiglu", activation_params=None, activation_clamp=None):
             return activation, activation_params, activation_clamp
@@ -145,6 +221,21 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
         )
         self.assertEqual(mega_moe(**kwargs), ("situglu", {"beta": 1.0}))
 
+    def test_situ_preserves_explicit_zero_parameters(self):
+        def mega_moe(*, activation, activation_params):
+            return activation, activation_params
+
+        kwargs = select_mega_moe_activation_kwargs(
+            mega_moe,
+            activation=MoEActivation.SITU,
+            activation_clamp=4.0,
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
+            situ_beta=0.0,
+            situ_linear_beta=0.0,
+        )
+        self.assertEqual(mega_moe(**kwargs), ("situglu", {"beta": 0.0, "linear_beta": 0.0}))
+
     def test_situ_rejects_legacy_and_oai_only_wrappers(self):
         def legacy(*args, activation_clamp=None):
             pass
@@ -158,7 +249,7 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
                     op, activation="situ", activation_clamp=None, swiglu_alpha=1.0, swiglu_beta=0.0
                 )
 
-    def test_non_situ_activations_preserve_legacy_passthrough(self):
+    def test_other_activations_preserve_legacy_passthrough(self):
         def legacy(*, activation_clamp=None):
             return activation_clamp
 
@@ -170,7 +261,6 @@ class TestMegaMoeActivationKwargs(unittest.TestCase):
             "relu",
             "relu2",
             "silu_no_mul",
-            "swiglustep",
             "legacy_custom",
             None,
             MoEActivation.SILU,

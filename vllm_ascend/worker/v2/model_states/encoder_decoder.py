@@ -77,6 +77,7 @@ class AscendEncoderDecoderModelState(EncoderDecoderModelState):
             num_actual_tokens=num_actual_tokens,
             num_input_tokens=num_input_tokens,
             is_prefilling=is_prefilling,
+            has_prefill=input_batch.has_prefill,
             query_start_loc_gpu=input_batch.query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,

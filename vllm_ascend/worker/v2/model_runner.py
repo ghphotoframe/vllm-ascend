@@ -55,10 +55,12 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
+    get_staged_mc2_tokens_capacity,
     override_mrv2_in_profile_run,
     select_moe_comm_method,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    use_cann_megamoe,
 )
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
@@ -737,6 +739,27 @@ class NPUModelRunner(GPUModelRunner):
             allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         with override_mrv2_in_profile_run(True):
+            if self.ascend_config.disable_megamoe_for_decode and use_cann_megamoe(self.vllm_config):
+                # The upstream max-token memory profile below runs MegaMoE.
+                # Also reserve staged decode workspaces before KV allocation;
+                # attention is deliberately absent during memory profiling.
+                # Decode graph candidates cannot exceed max_num_reqs; a raw
+                # capture-size entry above that limit is never captured.
+                decode_tokens = min(profile_max_num_tokens, self.max_num_reqs * self.decode_query_len)
+                staged_capacity = get_staged_mc2_tokens_capacity(self.vllm_config)
+                decode_profile_sizes = sorted({min(decode_tokens, staged_capacity), decode_tokens})
+                with (
+                    disable_compilation(self.get_model()),
+                    override_mrv2_in_profile_run(True, has_prefill=False),
+                ):
+                    for num_tokens in decode_profile_sizes:
+                        self._dummy_run(
+                            num_tokens,
+                            skip_attn=True,
+                            skip_eplb=True,
+                            uniform_decode=True,
+                            is_profile=True,
+                        )
             if (
                 mc2_tokens_capacity is not None
                 and self.max_num_tokens > mc2_tokens_capacity

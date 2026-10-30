@@ -31,7 +31,7 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
-_MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
+_MRV2_IN_PROFILE_RUN: ContextVar[tuple[bool, bool | None]] = ContextVar("_MRV2_IN_PROFILE_RUN", default=(False, None))
 
 
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
@@ -65,15 +65,17 @@ def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
 
 
 @contextmanager
-def override_mrv2_in_profile_run(enabled: bool):
+def override_mrv2_in_profile_run(enabled: bool, *, has_prefill: bool | None = None):
     """Override MRv2's extra profile-run marker for one forward path.
 
     MRv2 builds the base forward context inside upstream vLLM, so Ascend's
     platform hook cannot tell whether the current forward is the extra MC2
     profile dummy run. A ContextVar keeps this MRv2-only state scoped to the
-    current forward path without adding default fallback behavior.
+    current forward path without adding default fallback behavior. Profiling
+    skips attention metadata; its explicit phase lets both MoE backends reserve
+    workspace before the KV cache memory budget is calculated.
     """
-    token = _MRV2_IN_PROFILE_RUN.set(enabled)
+    token = _MRV2_IN_PROFILE_RUN.set((enabled, has_prefill))
     try:
         yield
     finally:
@@ -81,7 +83,11 @@ def override_mrv2_in_profile_run(enabled: bool):
 
 
 def get_mrv2_in_profile_run() -> bool:
-    return _MRV2_IN_PROFILE_RUN.get()
+    return _MRV2_IN_PROFILE_RUN.get()[0]
+
+
+def get_mrv2_profile_has_prefill() -> bool | None:
+    return _MRV2_IN_PROFILE_RUN.get()[1]
 
 
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
@@ -278,6 +284,13 @@ def get_mc2_tokens_capacity():
     return _mc2_tokens_capacity
 
 
+def get_staged_mc2_tokens_capacity(vllm_config: VllmConfig) -> int:
+    """Bound the ordinary MC2 path even when MegaMoE reserves a larger buffer."""
+    per_rank_limit = _MC2_TOKENS_PER_RANK_LIMIT * vllm_config.parallel_config.tensor_parallel_size
+    capacity = get_mc2_tokens_capacity()
+    return per_rank_limit if capacity is None else min(capacity, per_rank_limit)
+
+
 def set_mc2_mask(vllm_config, device):
     global _reserved_mc2_mask
     if _reserved_mc2_mask is not None:
@@ -375,6 +388,7 @@ def select_moe_comm_method(
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    has_prefill: bool | None = None,
 ) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
@@ -385,6 +399,8 @@ def select_moe_comm_method(
         is_draft_model (bool): Whether the model runs in MTP mode.
         draft_moe_quant_type (QuantType): The draft model's MoE quantization
             type, used on A5 to decide whether the draft can use mega moe.
+        has_prefill (bool | None): Whether this execution contains prefill.
+            None preserves the configured backend for profiling/legacy callers.
     Returns:
         MoECommType | None: The selected MoE communication method.
     """
@@ -404,6 +420,16 @@ def select_moe_comm_method(
         moe_comm_type = MoECommType.ALLTOALL
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
+    elif (
+        has_prefill is False
+        and getattr(get_ascend_config(), "disable_megamoe_for_decode", False)
+        and use_cann_megamoe(vllm_config)
+    ):
+        # Bypass BOTH fused selections in the A3 policy. The global MegaMoE
+        # capability stays enabled for weight loading and prefill forwards.
+        # Its buffer can exceed ordinary MC2's 512-token/rank contract.
+        staged_capacity = get_staged_mc2_tokens_capacity(vllm_config)
+        moe_comm_type = MoECommType.MC2 if num_tokens is None or num_tokens <= staged_capacity else MoECommType.ALLTOALL
     else:
         moe_comm_type = _MOE_COMM_SELECTORS[moe_comm_policy](
             num_tokens,
@@ -414,13 +440,14 @@ def select_moe_comm_method(
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "
-        "is_draft_model=%s, draft_moe_quant_type=%r",
+        "is_draft_model=%s, draft_moe_quant_type=%r, has_prefill=%s",
         moe_comm_policy,
         moe_comm_type,
         num_tokens,
         mc2_tokens_capacity,
         is_draft_model,
         draft_moe_quant_type,
+        has_prefill,
     )
     return moe_comm_type
 

@@ -23,7 +23,8 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+import torch
+from pydantic import ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -438,6 +439,8 @@ class AscendConfig:
             "mega_moe_max_tokens": 65536,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "enable_fused_mc2": 0,
+            "enable_megamoe_weight_padding": false,
+            "disable_megamoe_for_decode": false,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
@@ -603,6 +606,14 @@ class AscendConfig:
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
+    # Opt in to padding A3 BF16 MegaMoE weights to 512 alignment.
+    # Unaligned weights without padding have no accuracy guarantee.
+    enable_megamoe_weight_padding: bool = False
+    # Keep the normal staged MoE path for pure decode batches while retaining
+    # MegaMoE for prefill/mixed batches. Does not change loaded weight shapes.
+    # Initial support: A3 BF16 routed experts, MRv2, DP1, no speculative decode,
+    # and NONE/FULL_DECODE_ONLY graphs (other modes lack phase-specific keys).
+    disable_megamoe_for_decode: bool = False
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
@@ -858,6 +869,7 @@ class AscendConfig:
             logger.warning_once(
                 "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
             )
+        self._validate_megamoe_decode_policy(vc)
 
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only
         # freed by MLAPO in the MLA attention path, so the keep switch is only
@@ -1009,6 +1021,66 @@ class AscendConfig:
                 "Please set additional_config.enable_fused_mc2 to 0."
             )
 
+    def _validate_megamoe_decode_policy(self, vllm_config: VllmConfig) -> None:
+        if not self.disable_megamoe_for_decode or self.enable_fused_mc2 != 1 or not is_mega_moe_supported():
+            return
+        profile = get_current_hardware_profile()
+        parallel = vllm_config.parallel_config
+        ep_size = parallel.world_size_across_dp // parallel.pipeline_parallel_size
+        # Match the config-time prerequisites of use_cann_megamoe. The switch
+        # remains a no-op when this service cannot select the MegaMoE backend.
+        if (
+            not profile.supports(HardwareCapability.CANN_MEGAMOE)
+            or not vllm_config.model_config.is_moe
+            or not parallel.enable_expert_parallel
+            or not 1 < ep_size <= 64
+            or vllm_config.lora_config is not None
+        ):
+            return
+
+        prefix = "disable_megamoe_for_decode=True"
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(f"{prefix} requires Model Runner V2 to provide the scheduled batch phase.")
+        if parallel.data_parallel_size != 1:
+            raise ValueError(f"{prefix} currently requires DP1; EP ranks must choose the same collective backend.")
+        if vllm_config.speculative_config is not None:
+            raise ValueError(f"{prefix} currently does not support speculative decoding or draft-model MoE layouts.")
+
+        from vllm.config import CUDAGraphMode
+
+        if vllm_config.compilation_config.cudagraph_mode not in (
+            CUDAGraphMode.NONE,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+        ):
+            raise ValueError(f"{prefix} requires NONE or FULL_DECODE_ONLY graphs to keep backend capture unambiguous.")
+
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_text_config
+        quant_config = vllm_config.quant_config
+        quant_description = getattr(quant_config, "quant_description", None)
+        # --quantization ascend also loads BF16 checkpoints. Check actual
+        # routed expert metadata, not the name of the quantization plugin.
+        quantized_experts = any(getattr(hf_config, name, None) is not None for name in ("moe_quantize", "quantize"))
+        if quant_config is not None:
+            if not isinstance(quant_description, dict):
+                quantized_experts = True
+            else:
+                quantized_experts |= any(
+                    isinstance(name, str)
+                    and ".experts." in f".{name}"
+                    and name.endswith(".weight")
+                    and kind not in (None, "FLOAT")
+                    for name, kind in quant_description.items()
+                )
+        if (
+            profile.supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+            or model_config.dtype != torch.bfloat16
+            or quantized_experts
+        ):
+            raise ValueError(
+                f"{prefix} currently supports only A3 BF16 unquantized routed experts with shared ND weights."
+            )
+
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.uses_packed_sfa_main_cache:
             raise NotImplementedError(
@@ -1049,7 +1121,8 @@ class AscendConfig:
 
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
-        if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
+        hardware_profile = get_current_hardware_profile()
+        if hardware_profile.supports(HardwareCapability.CANN_MEGAMOE_MXFP):
             mega_moe_supported_by_config = AscendConfig._is_a5_megamoe_supported_by_config(vllm_config)
             logger.debug("mega moe operator is supported by current a5 config: %r", mega_moe_supported_by_config)
             return mega_moe_supported_by_config
@@ -1070,10 +1143,21 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
-        if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
+        quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
+        # The A3 BF16 loader normally pads a 768-wide checkpoint to I=1024.
+        # The padding switch may bypass this for performance experiments only.
+        # Keep this exception restricted to the formats handled by that loader.
+        supports_unquantized_768 = (
+            hardware_profile.supports(HardwareCapability.CANN_MEGAMOE)
+            and quant_type is None
+            and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
+            and moe_intermediate_size == 768
+        )
+        if not supports_unquantized_768 and (
+            moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0
+        ):
             return False
 
-        quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
         if quant_type is None:
             return True
         quant_name = str(getattr(quant_type, "name", quant_type)).lower()

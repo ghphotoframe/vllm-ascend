@@ -27,6 +27,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoERouter, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import align_moe_weights_for_fi
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -47,6 +48,8 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+
+_CANN_MEGAMOE_BF16_INTERMEDIATE_ALIGNMENT = 512
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -100,14 +103,56 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def supports_fused_activation(self, activation) -> bool:
         return False
 
+    def _align_cann_megamoe_weights(self, layer, use_megamoe: bool):
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        if not use_megamoe or w13.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
+            return w13, w2
+        profile = get_current_hardware_profile()
+        if not profile.supports(HardwareCapability.CANN_MEGAMOE) or profile.supports(
+            HardwareCapability.CANN_MEGAMOE_MXFP
+        ):
+            return w13, w2
+        if not get_ascend_config().enable_megamoe_weight_padding:
+            return w13, w2
+
+        intermediate = w2.shape[-1]
+        if intermediate % _CANN_MEGAMOE_BF16_INTERMEDIATE_ALIGNMENT == 0:
+            return w13, w2
+        if self.moe.has_bias or not self.moe.is_act_and_mul:
+            raise ValueError("A3 BF16 MegaMoE intermediate padding requires bias-free gated experts.")
+        if w2.ndim != 3 or w13.shape != (w2.shape[0], 2 * intermediate, w2.shape[1]):
+            raise ValueError("A3 BF16 MegaMoE padding expects checkpoint weights [E, 2I, H] and [E, H, I].")
+
+        # This pure-Torch layout helper does not select a FlashInfer backend.
+        # Gate and up must be padded separately so both still have the same I;
+        # padding only the end of their concatenation would change the model.
+        w13, w2, padded_intermediate = align_moe_weights_for_fi(
+            w13, w2, is_act_and_mul=True, min_alignment=_CANN_MEGAMOE_BF16_INTERMEDIATE_ALIGNMENT
+        )
+        logger.info(
+            "A3 BF16 MegaMoE padding: layer=%s intermediate=%d->%d w13=%s w2=%s (post-transpose).",
+            layer.layer_name,
+            intermediate,
+            padded_intermediate,
+            (w13.shape[0], w13.shape[2], w13.shape[1]),
+            (w2.shape[0], w2.shape[2], w2.shape[1]),
+        )
+        # Keep checkpoint/model sizes unchanged. The CANN communicator reads
+        # the physical intermediate dimension from the processed weights.
+        return w13, w2
+
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
+        enable_fused_mc2 = get_ascend_config().enable_fused_mc2
+        use_megamoe = bool(enable_fused_mc2 and use_cann_megamoe(get_current_vllm_config()))
+        w13_data, w2_data = self._align_cann_megamoe_weights(layer, use_megamoe)
 
         # Keep expert-aware loaders attached for later online weight updates.
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+        w13_data = self._maybe_pad_weight(w13_data).transpose(1, 2).contiguous()
         replace_parameter(layer, "w13_weight", w13_data)
 
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+        w2_data = self._maybe_pad_weight(w2_data).transpose(1, 2).contiguous()
         replace_parameter(layer, "w2_weight", w2_data)
 
         # TODO: Current dispatch_ffn_combine/mega_moe fusion operator ONLY supports NZ format.
@@ -116,9 +161,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # ND format (or other formats), remove this specific 'if' check and the forced
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
-        enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2:
-            use_megamoe = use_cann_megamoe(get_current_vllm_config())
             if not use_megamoe:
                 layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
                 layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)

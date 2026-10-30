@@ -362,6 +362,19 @@ def _get_parallel_config_for_attn_metadata(attn_groups: list[list[AttentionGroup
     return vllm_config.parallel_config if vllm_config is not None else None
 
 
+class AscendAttentionMetadataMap(dict[str, Any]):
+    """Layer metadata plus the scheduler's batch phase for MoE selection.
+
+    Keep the phase outside the layer-name mapping: attention consumers iterate
+    its entries, and query lengths cannot distinguish a short prefill from
+    decode. ``None`` means the caller did not supply request-phase metadata.
+    """
+
+    def __init__(self, *, has_prefill: bool | None):
+        super().__init__()
+        self.has_prefill = has_prefill
+
+
 def build_attn_metadata(
     *,
     attn_groups: list[list[AttentionGroup]],
@@ -389,6 +402,7 @@ def build_attn_metadata(
     num_actual_tokens: int | None = None,
     num_input_tokens: int | None = None,
     is_prefilling: torch.Tensor | None = None,
+    has_prefill: bool | None = None,
     pcp_context: "AscendPCPAttentionContext | None" = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
@@ -453,7 +467,7 @@ def build_attn_metadata(
     if positions is None:
         positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
 
-    attn_metadata: dict[str, Any] = {}
+    attn_metadata: dict[str, Any] = AscendAttentionMetadataMap(has_prefill=has_prefill)
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}

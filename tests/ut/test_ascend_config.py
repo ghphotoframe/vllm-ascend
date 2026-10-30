@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
+import torch
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -349,6 +350,8 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 65536)
+        self.assertFalse(ascend_config.enable_megamoe_weight_padding)
+        self.assertFalse(ascend_config.disable_megamoe_for_decode)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -356,6 +359,65 @@ class TestAscendConfig(TestBase):
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertFalse(ascend_config.rl_config.enabled)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_with_megamoe_experiment_switches(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "enable_megamoe_weight_padding": False,
+            "disable_megamoe_for_decode": True,
+        }
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertFalse(ascend_config.enable_megamoe_weight_padding)
+        self.assertTrue(ascend_config.disable_megamoe_for_decode)
+        # These switches neither enable MegaMoE nor change the source checkpoint.
+        self.assertEqual(ascend_config.enable_fused_mc2, 0)
+
+    def test_megamoe_experiment_switches_use_existing_bool_validation(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            enable_megamoe_weight_padding="false",
+            disable_megamoe_for_decode="true",
+        )
+        self.assertFalse(config.enable_megamoe_weight_padding)
+        self.assertTrue(config.disable_megamoe_for_decode)
+        for key in ("enable_megamoe_weight_padding", "disable_megamoe_for_decode"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **{key: "invalid"})
+
+    def test_megamoe_weight_padding_defaults_to_disabled(self):
+        for kwargs in (
+            {},
+            {"enable_fused_mc2": 0},
+            {"enable_fused_mc2": 1},
+            {"enable_fused_mc2": 2},
+            {"enable_fused_mc2": "0"},
+            {"enable_fused_mc2": "1"},
+            {"enable_fused_mc2": "2"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **kwargs)
+                self.assertFalse(config.enable_megamoe_weight_padding)
+
+    def test_megamoe_weight_padding_explicit_override(self):
+        for mode in (0, 1, 2, "2"):
+            for value, expected in ((False, False), (True, True), ("false", False), ("true", True)):
+                with self.subTest(mode=mode, value=value):
+                    config = AscendConfig(
+                        sparse_kv_offload_config=SimpleNamespace(enabled=False),
+                        enable_fused_mc2=mode,
+                        enable_megamoe_weight_padding=value,
+                    )
+                    self.assertIs(config.enable_megamoe_weight_padding, expected)
+
+    def test_megamoe_weight_padding_default_preserves_mode_validation(self):
+        for mode in (None, "invalid", 2.5):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                AscendConfig(
+                    sparse_kv_offload_config=SimpleNamespace(enabled=False),
+                    enable_fused_mc2=mode,
+                )
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")
@@ -1360,7 +1422,193 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         self.assertEqual(cfg.eplb_policy_type, 2)
 
 
+class TestMegamoeDecodePolicyConfig(TestBase):
+    @staticmethod
+    def _make_config():
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_moe=True,
+                dtype=torch.bfloat16,
+                quantization="ascend",
+                hf_text_config=SimpleNamespace(hidden_size=2560, moe_intermediate_size=768),
+            ),
+            parallel_config=SimpleNamespace(
+                world_size_across_dp=8,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                enable_expert_parallel=True,
+            ),
+            compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY),
+            quant_config=SimpleNamespace(quant_description={"model.layers.0.mlp.experts.0.gate_proj.weight": "FLOAT"}),
+            use_v2_model_runner=True,
+            lora_config=None,
+            speculative_config=None,
+        )
+
+    @staticmethod
+    def _policy(enabled=True, fused=1):
+        config = object.__new__(AscendConfig)
+        config.disable_megamoe_for_decode = enabled
+        config.enable_fused_mc2 = fused
+        return config
+
+    @patch("vllm_ascend.ascend_config.is_mega_moe_supported", return_value=True)
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_bf16_ascend_plugin_allows_supported_graph_modes(self, _profile, _supported):
+        vc = self._make_config()
+        for graph_mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY):
+            with self.subTest(graph_mode=graph_mode):
+                vc.compilation_config.cudagraph_mode = graph_mode
+                self._policy()._validate_megamoe_decode_policy(vc)
+
+    @patch("vllm_ascend.ascend_config.is_mega_moe_supported", return_value=True)
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_rejects_unsupported_execution_contracts(self, _profile, _supported):
+        for scenario, expected in (
+            ("mrv1", "Model Runner V2"),
+            ("dp2", "DP1"),
+            ("mtp", "speculative decoding"),
+            ("piecewise", "NONE or FULL_DECODE_ONLY"),
+            ("full", "NONE or FULL_DECODE_ONLY"),
+            ("fp16", "BF16 unquantized"),
+            ("hf_quant", "BF16 unquantized"),
+            ("hf_null_moe_quant", "BF16 unquantized"),
+            ("layer_quant", "BF16 unquantized"),
+            ("root_layer_quant", "BF16 unquantized"),
+            ("unknown_quant", "BF16 unquantized"),
+        ):
+            vc = self._make_config()
+            if scenario == "mrv1":
+                vc.use_v2_model_runner = False
+            elif scenario == "dp2":
+                vc.parallel_config.data_parallel_size = 2
+                vc.parallel_config.world_size_across_dp = 16
+            elif scenario == "mtp":
+                vc.speculative_config = SimpleNamespace(method="mtp")
+            elif scenario in ("piecewise", "full"):
+                vc.compilation_config.cudagraph_mode = getattr(CUDAGraphMode, scenario.upper())
+            elif scenario == "fp16":
+                vc.model_config.dtype = torch.float16
+            elif scenario == "hf_quant":
+                vc.model_config.hf_text_config.moe_quantize = "w4a8"
+            elif scenario == "hf_null_moe_quant":
+                vc.model_config.hf_text_config.moe_quantize = None
+                vc.model_config.hf_text_config.quantize = "w4a8"
+            elif scenario == "layer_quant":
+                vc.quant_config.quant_description["model.layers.0.mlp.experts.0.gate_proj.weight"] = "W4A8_DYNAMIC"
+            elif scenario == "root_layer_quant":
+                vc.quant_config.quant_description = {"experts.0.gate_proj.weight": "W4A8_DYNAMIC"}
+            else:
+                vc.quant_config = SimpleNamespace()
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(ValueError, expected):
+                self._policy()._validate_megamoe_decode_policy(vc)
+
+    @patch("vllm_ascend.ascend_config.is_mega_moe_supported", return_value=True)
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A5),
+    )
+    def test_rejects_a5_weight_layout(self, _profile, _supported):
+        with self.assertRaisesRegex(ValueError, "A3 BF16"):
+            self._policy()._validate_megamoe_decode_policy(self._make_config())
+
+    def test_switch_is_noop_without_active_megamoe(self):
+        # Early exits must not inspect unsupported runner/model metadata.
+        self._policy(enabled=False)._validate_megamoe_decode_policy(SimpleNamespace())
+        self._policy(fused=0)._validate_megamoe_decode_policy(SimpleNamespace())
+        with patch("vllm_ascend.ascend_config.is_mega_moe_supported", return_value=False):
+            self._policy()._validate_megamoe_decode_policy(SimpleNamespace())
+
+    @patch("vllm_ascend.ascend_config.is_mega_moe_supported", return_value=True)
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_switch_is_noop_when_megamoe_cannot_be_selected(self, _profile, _supported):
+        for scenario in ("no_ep", "ep1", "dense", "lora"):
+            vc = self._make_config()
+            vc.use_v2_model_runner = False
+            if scenario == "no_ep":
+                vc.parallel_config.enable_expert_parallel = False
+            elif scenario == "ep1":
+                vc.parallel_config.world_size_across_dp = 1
+            elif scenario == "dense":
+                vc.model_config.is_moe = False
+            else:
+                vc.lora_config = SimpleNamespace()
+            with self.subTest(scenario=scenario):
+                self._policy()._validate_megamoe_decode_policy(vc)
+
+
 class TestUpstreamConfigCompatibility(TestBase):
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_a3_megamoe_unquantized_768(self, _mock_profile):
+        text_config = SimpleNamespace(hidden_size=2560, moe_intermediate_size=768)
+        vc = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config, dtype=torch.bfloat16))
+        self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        with patch.object(text_config, "moe_quantize", None, create=True):
+            self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+        for dtype in (torch.float16, torch.float32, None):
+            with self.subTest(dtype=dtype), patch.object(vc.model_config, "dtype", dtype):
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+        for quant_field in ("moe_quantize", "quantize"):
+            for quant_type in ("w8a8", "w4a8", "w8a8_dynamic", "w4a8_dynamic", "mxfp8"):
+                with (
+                    self.subTest(quant_field=quant_field, quant_type=quant_type),
+                    patch.object(text_config, quant_field, quant_type, create=True),
+                ):
+                    self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+        with patch.object(text_config, "hidden_size", 896):
+            self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
+    @patch("vllm_ascend.ascend_config.get_current_hardware_profile")
+    def test_megamoe_768_does_not_expand_other_profiles(self, mock_profile):
+        vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
+                architectures=["BailingMM2NativeForConditionalGeneration"],
+                hf_text_config=SimpleNamespace(hidden_size=4096, moe_intermediate_size=768),
+                get_num_experts=lambda: 512,
+            ),
+            parallel_config=SimpleNamespace(world_size_across_dp=8, pipeline_parallel_size=1),
+        )
+        for device_type in (AscendDeviceType.A2, AscendDeviceType._310P, AscendDeviceType.A5):
+            with self.subTest(device_type=device_type):
+                mock_profile.return_value = get_hardware_profile(device_type)
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile",
+        return_value=get_hardware_profile(AscendDeviceType.A3),
+    )
+    def test_a3_megamoe_existing_width_and_quantization_constraints(self, _mock_profile):
+        text_config = SimpleNamespace(hidden_size=2560, moe_intermediate_size=1024)
+        vc = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config))
+        for quant_type in (None, "w8a8", "w4a8", "w8a8_dynamic", "w4a8_dynamic"):
+            text_config.moe_quantize = quant_type
+            for width in (1024, 1536, 2048, 2560, 3072):
+                with self.subTest(quant_type=quant_type, width=width):
+                    text_config.moe_intermediate_size = width
+                    self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vc))
+            for width in (512, 767, 769, 1023, 1025, 3073, 3584):
+                with self.subTest(quant_type=quant_type, width=width):
+                    text_config.moe_intermediate_size = width
+                    self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+        text_config.moe_intermediate_size = 1024
+        for quant_type in ("mxfp8", "unknown"):
+            with self.subTest(quant_type=quant_type):
+                text_config.moe_quantize = quant_type
+                self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vc))
+
     @patch(
         "vllm_ascend.ascend_config.get_current_hardware_profile",
         return_value=get_hardware_profile(AscendDeviceType.A5),

@@ -389,6 +389,7 @@ class FusedMC2CommImpl(MoECommMethod):
         dispatch_quant_out_dtype: torch.dtype | None = None,
         *,
         is_decode_only_node: bool,
+        intermediate_hidden: int | None = None,
     ):
         # FusedMC2CommImpl always builds a TokenDispatcherWithMC2 (see
         # setup_moe_comm_method), which is where global_bs / ep_world_size live.
@@ -460,7 +461,11 @@ class FusedMC2CommImpl(MoECommMethod):
             num_max_tokens_per_rank,
             num_topk,
             hidden=self.moe_config.hidden_dim,
-            intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
+            intermediate_hidden=(
+                intermediate_hidden
+                if intermediate_hidden is not None
+                else 2 * self.moe_config.intermediate_size_per_partition
+            ),
             max_recv_token_num=max_recv_token_num,
             dispatch_quant_mode=dispatch_quant_mode,
             dispatch_quant_out_dtype=dispatch_quant_out_dtype,
@@ -502,10 +507,15 @@ class FusedMC2CommImpl(MoECommMethod):
         )
 
         if self.mega_moe_symm_buffer is None:
+            # BF16 ND weights may have a padded physical I while moe_config
+            # retains the checkpoint's logical I. Quantized layouts keep their
+            # existing metadata rules (including packed INT4 dimensions).
+            intermediate_hidden = weight1[0].shape[-1] if weight1[0].dtype == torch.bfloat16 else None
             self.mega_moe_symm_buffer = self._init_mega_moe_symm_buffer(
                 dispatch_quant_mode,
                 dispatch_quant_out_dtype,
                 is_decode_only_node=is_decode_only_node,
+                intermediate_hidden=intermediate_hidden,
             )
         else:
             self.mega_moe_symm_buffer.dispatch_quant_mode = dispatch_quant_mode

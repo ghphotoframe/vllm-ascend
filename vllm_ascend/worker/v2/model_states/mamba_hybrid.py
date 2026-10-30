@@ -338,6 +338,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             num_actual_reqs=input_batch.num_reqs,
             num_tokens=num_tokens,
             num_actual_tokens=input_batch.num_tokens,
+            has_prefill=input_batch.has_prefill,
             query_start_loc_gpu=input_batch.query_start_loc,
             query_start_loc_cpu=torch.from_numpy(input_batch.query_start_loc_np),
             max_query_len=input_batch.num_scheduled_tokens.max().item(),

@@ -575,9 +575,11 @@ class NPUPlatform(Platform):
         """
         # NOTE(Ronald1995): avoid circular import.
         from vllm_ascend.ascend_forward_context import (
+            MoECommType,
             _is_decode_only_node,
             get_mc2_mask,
             get_mrv2_in_profile_run,
+            get_mrv2_profile_has_prefill,
             select_moe_comm_method,
             use_cann_megamoe,
         )
@@ -634,9 +636,24 @@ class NPUPlatform(Platform):
 
         # NOTE: Must use max_tokens_across_dp instead of num_tokens for MoE comm method selection
         # to ensure consistent communication method across all DP ranks
+        has_prefill = getattr(attn_metadata, "has_prefill", None)
+        if has_prefill is None:
+            if (
+                attn_metadata is not None
+                and get_ascend_config().disable_megamoe_for_decode
+                and use_cann_megamoe(vllm_config)
+            ):
+                raise RuntimeError(
+                    "disable_megamoe_for_decode requires MRv2 attention metadata "
+                    "with the scheduler's has_prefill phase."
+                )
+            # Memory profiling deliberately skips attention and has no metadata.
+            # Its scoped override must not replace a real request's phase.
+            has_prefill = get_mrv2_profile_has_prefill()
         moe_comm_type = select_moe_comm_method(
             max_tokens_across_dp,
             vllm_config,
+            has_prefill=has_prefill,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 
@@ -654,7 +671,7 @@ class NPUPlatform(Platform):
         return {
             "moe_comm_type": moe_comm_type,
             "moe_comm_method": moe_comm_method,
-            "use_mega_moe": use_cann_megamoe(vllm_config),
+            "use_mega_moe": moe_comm_type is MoECommType.FUSED_MC2 and use_cann_megamoe(vllm_config),
             "is_decode_only_node": _is_decode_only_node(vllm_config),
             "capturing": capturing,
             "mmrs_fusion": mmrs_fusion,

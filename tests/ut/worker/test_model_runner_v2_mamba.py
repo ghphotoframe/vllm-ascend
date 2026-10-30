@@ -338,6 +338,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
         num_tokens=2 * (num_spec + 1),
         num_tokens_after_padding=4 * (num_spec + 1),
         is_prefilling_np=np.array([False, False]),
+        has_prefill=False,
         idx_mapping=torch.tensor([0, 1]),
         num_draft_tokens_per_req=np.full(2, num_spec, dtype=np.int32),
         num_scheduled_tokens=np.full(2, num_spec + 1, dtype=np.int32),
@@ -363,6 +364,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
     assert metadata is expected_metadata
     kwargs = mock_build_attn_metadata.call_args.kwargs
     assert kwargs["num_actual_reqs"] == 2
+    assert kwargs["has_prefill"] is False
     assert kwargs["num_actual_tokens"] == 2 * (num_spec + 1)
     graph_requests = 4 if graph_mode == CUDAGraphMode.FULL else 2
     assert kwargs["num_reqs"] == graph_requests
