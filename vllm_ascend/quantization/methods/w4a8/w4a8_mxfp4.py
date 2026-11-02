@@ -19,6 +19,7 @@
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -140,7 +141,13 @@ class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
         )
         layer.weight.data = layer.weight.data.transpose(-1, -2)
         n, k = layer.weight_scale.shape
-        layer.weight_scale.data = layer.weight_scale.data.reshape(n, k // 2, 2).transpose(-3, -2)
+        # CANN's paired E8M0 layout stores two MX32 scales per tile.
+        # TP8 shared experts have K=160 (five scales); retain all five
+        # and fill only the unused sixth slot, as in the MXFP8 loader.
+        scale = layer.weight_scale.data
+        if k % 2:
+            scale = F.pad(scale, (0, 1), mode="constant", value=0)
+        layer.weight_scale.data = scale.reshape(n, (k + 1) // 2, 2).transpose(-3, -2)
         layer._mxfp4_transformed = True
 
     def restore_weights_for_rl_loading(self, layer):
@@ -154,7 +161,8 @@ class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
         layer.weight.data = layer.weight.data.transpose(-1, -2)
         layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 2)
         orig_scale_shape = layer._mxfp4_original_shapes["weight_scale"]
-        layer.weight_scale.data = layer.weight_scale.data.transpose(-3, -2).reshape(orig_scale_shape)
+        paired_scale = layer.weight_scale.data.transpose(-3, -2).reshape(orig_scale_shape[0], -1)
+        layer.weight_scale.data = paired_scale[:, : orig_scale_shape[1]].contiguous()
         layer._mxfp4_transformed = False
 
 
