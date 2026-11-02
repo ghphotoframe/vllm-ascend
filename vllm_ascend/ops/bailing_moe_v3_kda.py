@@ -16,6 +16,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 from vllm_ascend.ops.kda_conv import native_conv_state_supported, pack_kda_conv_weights, run_causal_conv1d
+from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state, gather_update_conv_state
 
 _KDA_MAX_RECURRENT_TOKENS = 8
@@ -276,6 +277,12 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         *,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if num_accepted_tokens is not None:
+            # Accepted count describes the previous verification, whose length
+            # may exceed this query after a shortened speculative proposal.
+            num_accepted_tokens = rebase_short_kda_queries(
+                recurrent_state, state_indices, cu_seqlens, num_accepted_tokens
+            )
         return run_recurrent_kda(
             q,
             k,

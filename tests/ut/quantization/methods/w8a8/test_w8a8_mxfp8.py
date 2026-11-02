@@ -461,6 +461,68 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         self.assertIs(weight_views[0], weights.w1)
         self.assertIs(weight_views[2], weights.w1_scale)
 
+    def test_positive_swiglu_limit_keeps_clipping_before_activation_quant(self):
+        for tokens in (0, 5):
+            for group_list_type in (0, 1):
+                with self.subTest(tokens=tokens, group_list_type=group_list_type):
+                    gate = torch.tensor([-11.0, -10.0, 0.0, 10.0, 11.0])[:tokens, None]
+                    up = -gate
+                    gmm_output = torch.cat([gate, up], dim=-1)
+                    expected = torch.nn.functional.silu(gate.clamp(max=10)) * up.clamp(-10, 10)
+                    compute_input = SimpleNamespace(
+                        swiglu_limit=10.0, activation="silu", group_list_type=group_list_type
+                    )
+                    with (
+                        patch.object(self.scheme, "apply_gmm1", return_value=gmm_output) as gmm,
+                        patch.object(self.scheme, "apply_act_quant", side_effect=lambda inp, x: (x, None)) as quant,
+                        patch(
+                            "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_swiglu",
+                            side_effect=lambda x: torch.nn.functional.silu(x[:, :1]) * x[:, 1:],
+                        ),
+                        patch("torch_npu.npu_grouped_matmul_swiglu_quant_v2") as fused,
+                    ):
+                        actual, scale = self.scheme.apply_gmm1_act_quant(compute_input)
+                    torch.testing.assert_close(actual, expected)
+                    self.assertIsNone(scale)
+                    gmm.assert_called_once_with(compute_input)
+                    quant.assert_called_once_with(compute_input, actual)
+                    fused.assert_not_called()
+
+    def test_unlimited_swiglu_keeps_original_fused_path(self):
+        module = "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8."
+        for limit, use_lists in ((0.0, False), (0.0, True), (-1.0, False), (-1.0, True)):
+            with self.subTest(limit=limit, use_lists=use_lists):
+                x = torch.zeros(2, 128)
+                scale = torch.ones(2, 4, dtype=torch.uint8)
+                output = torch.zeros(2, 256)
+                compute_input = SimpleNamespace(
+                    swiglu_limit=limit,
+                    hidden_states=x,
+                    dynamic_scale=None,
+                    layer=SimpleNamespace(
+                        w13_weight=torch.zeros(1),
+                        w13_weight_scale=torch.ones(1),
+                        w13_weight_list=[torch.zeros(1)],
+                        w13_weight_scale_list=[torch.ones(1)],
+                    ),
+                    group_list=torch.tensor([2]),
+                    group_list_type=0,
+                )
+                with (
+                    patch.object(self.scheme, "use_expert_weight_list", use_lists),
+                    patch.object(self.scheme, "_quant_hidden_states", return_value=(x, scale)),
+                    patch.object(self.scheme, "apply_gmm1") as separate,
+                    patch(module + "cumsum_group_list", return_value=compute_input.group_list),
+                    patch(module + "dispose_tensor"),
+                    patch(module + "maybe_normalize_mxfp_scale_layout", side_effect=lambda x: x),
+                    patch("torch_npu.npu_grouped_matmul_swiglu_quant_v2", return_value=(output, scale)) as fused,
+                ):
+                    actual = self.scheme.apply_gmm1_act_quant(compute_input)
+                self.assertIs(actual[0], output)
+                self.assertIs(actual[1], scale)
+                fused.assert_called_once()
+                separate.assert_not_called()
+
     def test_get_weight_various_expert_counts(self):
         for num_experts in [4, 8, 16]:
             result = self.scheme.get_weight(num_experts, self.intermediate_size, self.hidden_size, torch.bfloat16)
