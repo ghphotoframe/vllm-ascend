@@ -1871,7 +1871,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         slots: torch.Tensor,
         return_current_kv: bool = False,
     ):
-        if self._uses_strided_kv_adapter() and any(not cache.is_contiguous() for cache in kv_cache):
+        if (self._uses_strided_kv_adapter() or self._uses_bounded_projected_kv_writer()) and any(
+            not cache.is_contiguous() for cache in kv_cache
+        ):
             current_k_pe, current_k_nope = self._exec_strided_kv_writer(kv_no_split, cos, sin, kv_cache, slots)
             if return_current_kv:
                 return kv_cache[1], kv_cache[0], current_k_pe, current_k_nope
@@ -2058,6 +2060,32 @@ class AscendMLAImpl(MLAAttentionImpl):
             and self._supports_strided_mla_projection()
         )
 
+    def _uses_bounded_projected_kv_writer(self) -> bool:
+        """Bound draft KV writes without changing projection or allocation.
+
+        This writer consumes already-projected BF16 KV, so unsupported Q
+        projections (including FP8Block) do not exclude it. Keep this runtime
+        fallback separate from supports_strided_mla_writer: advertising a new
+        layout on only one PD endpoint would change the raw transfer contract.
+        """
+        return (
+            self.support_fp8_attention
+            and self.is_draft_model
+            and not self.pcp_enabled
+            and not self.dcp_enabled
+            and self.num_kv_heads == 1
+            and self.use_mla_rope
+            and self.qk_rope_head_dim > 0
+            and self.dtype == torch.bfloat16
+            and not self.fa_quant_layer
+            and not self.enable_kv_nz
+            and self.kv_a_layernorm is not None
+            and isinstance(getattr(self.kv_a_layernorm, "weight", None), torch.Tensor)
+            and self.kv_a_layernorm.weight.dtype == torch.bfloat16
+            and hasattr(torch_npu, "npu_kv_rmsnorm_rope_cache")
+            and not self.supports_prolog_v3_writer()
+        )
+
     def supports_strided_mla_writer(self) -> bool:
         """Allocation requires either PROLOG_V3 or a prepared writer adapter."""
         return self.supports_prolog_v3_writer() or (
@@ -2066,7 +2094,10 @@ class AscendMLAImpl(MLAAttentionImpl):
 
     def _prepare_strided_kv_workspace(self) -> None:
         """Allocate during weight loading, before KV sizing, and retain graph addresses."""
-        if not self._uses_strided_kv_adapter() or getattr(self, "_strided_kv_workspace", None) is not None:
+        if (
+            not (self._uses_strided_kv_adapter() or self._uses_bounded_projected_kv_writer())
+            or getattr(self, "_strided_kv_workspace", None) is not None
+        ):
             return
         assert self.kv_a_layernorm is not None
         capacity = max(
@@ -2080,6 +2111,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             torch.empty((*shape, self.kv_lora_rank), dtype=self.dtype, device=device),
             torch.empty((*shape, self.qk_rope_head_dim), dtype=self.dtype, device=device),
             torch.arange(capacity, dtype=torch.int64, device=device),
+        )
+        logger.info(
+            "Prepared bounded projected MLA KV writer: layer=%s capacity=%d block_size=%d",
+            self.layer_name,
+            capacity,
+            block_size,
         )
 
     def _exec_strided_kv_writer(self, kv_no_split, cos, sin, kv_cache, slots):
@@ -2102,6 +2139,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             # The standard scatter supports padded pages with dense token rows,
             # but not A5's token-fused NoPE/RoPE slices. Fail before either write.
             raise RuntimeError("Bailing MLA KV scatter requires component-major caches on this device.")
+        if any(cache.dtype != self.dtype for cache in kv_cache):
+            raise RuntimeError("Strided MLA KV writer requires unquantized caches matching the layer dtype.")
+        if slots.numel() != num_tokens or slots.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError("Strided MLA KV writer requires one INT32/INT64 slot per input token.")
         assert self.kv_a_layernorm is not None
         blocks = cdiv(num_tokens, nope.shape[1])
         torch_npu.npu_kv_rmsnorm_rope_cache(
@@ -2804,7 +2845,9 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if not self.use_mla_rope:
             k_pe, k_nope = self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
-        elif self._uses_strided_kv_adapter() and any(not cache.is_contiguous() for cache in kv_cache):
+        elif (self._uses_strided_kv_adapter() or self._uses_bounded_projected_kv_writer()) and any(
+            not cache.is_contiguous() for cache in kv_cache
+        ):
             k_pe, k_nope = self._exec_strided_kv_writer(kv_no_split, cos, sin, kv_cache, slots)
         else:
             assert self.kv_a_layernorm is not None

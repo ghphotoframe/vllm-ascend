@@ -201,10 +201,23 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
-        draft_model = super().load_draft_model(
-            target_model,
-            target_attn_layer_names,
-        )
+        # Upstream selects the draft class with model_config, but constructs
+        # its layers under the supplied VllmConfig. Preserve the target's
+        # HF/parallel/cache contracts while exposing the draft runner role,
+        # as the V1 proposer does. The metadata-only draft config has PP=1
+        # and must not replace the real worker topology during model loading.
+        target_config = self.vllm_config
+        draft_load_config = copy(target_config)
+        draft_load_config.model_config = copy(target_config.model_config)
+        draft_load_config.model_config.runner_type = self.draft_model_config.runner_type
+        self.vllm_config = draft_load_config
+        try:
+            draft_model = super().load_draft_model(
+                target_model,
+                target_attn_layer_names,
+            )
+        finally:
+            self.vllm_config = target_config
         self._maybe_remove_d2t(draft_model)
         return draft_model
 
