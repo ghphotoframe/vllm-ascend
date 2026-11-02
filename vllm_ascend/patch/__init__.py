@@ -574,11 +574,14 @@
 #       With PP batch queue, synchronous scheduling can schedule the next batch
 #       before the previous model output is consumed. Calling `post_step` in that
 #       window updates `request.spec_token_ids` from live request state that may
-#       already belong to the newer schedule step.
+#       already belong to the newer schedule step. A PD prefill node does not
+#       need CPU draft-token feedback, and fetching it can drain later PP batches.
 #    How：
 #       In PP + MTP + batch queue + sync scheduling, skip `post_step` after model
 #       execution and let scheduler output processing perform the spec token
-#       writeback from the corresponding `ModelRunnerOutput`.
+#       writeback from the corresponding `ModelRunnerOutput` in mixed deployment.
+#       Also skip the redundant draft-token RPC on V1 PD prefill nodes without
+#       enabling their sampled-token IPC path.
 #    Related PR (if no, explain why):
 #       Backport of local vLLM PP+MTP branch changes.
 #    Future Plan:
@@ -1529,6 +1532,22 @@
 #       Remove this patch when Triton-Ascend can compile and efficiently lower
 #       the upstream kernel, or after an equivalent fix lands upstream.
 #
+#   5. `vllm.v1.worker.gpu.sample.logit_bias._bias_kernel`
+#    Why:
+#       Discrete finite-value store masks generate unordered locks whose
+#       initialization races with preceding kernels in older Triton-Ascend.
+#    How:
+#       Rebind only the kernel to the Ascend implementation, keeping upstream
+#       Python wrappers and imported aliases. Select finite values with tl.where
+#       and retain the stop-token count boundary as the store mask.
+#    Related PR:
+#       https://github.com/triton-lang/triton-ascend/pull/2817
+#    Test:
+#       tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_logit_bias.py
+#    Future Plan:
+#       Remove this kernel override after the deployed Triton launcher includes
+#       the stream-ordered lock initialization fix and passes the overlap test.
+#
 # ** 29. File: worker/patch_v2/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
@@ -1738,3 +1757,19 @@
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
 #
+
+# ** File: platform/patch_shm_notify.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.device_communicators.shm_broadcast.SpinCondition.__init__`
+#   2. `vllm.distributed.device_communicators.shm_broadcast.SpinCondition.record_read`
+#    Why:
+#       Sustained SHM fast-path reads bypass notification polling. CONFLATE
+#       limits payloads but internal activate_read commands can accumulate.
+#    How:
+#       Backport upstream initialization and poll/recv behavior, servicing the
+#       notification socket every two seconds during successful reads.
+#       SHM and cancellation logic are unchanged.
+#    Related PR (if no, explain why):
+#       Merged upstream: https://github.com/vllm-project/vllm/pull/63165
+#    Future Plan:
+#       Remove once the supported vLLM version includes upstream PR #63165.

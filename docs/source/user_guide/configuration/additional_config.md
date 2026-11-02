@@ -12,17 +12,6 @@ Starting from [PR #9064](https://github.com/vllm-project/vllm-ascend/pull/9064),
 - **Recommendation**: Use `--additional-config` for new deployments and migrate existing configurations
 - **Future Plan**: Environment variables will be **removed** in a future release; only `--additional-config` will be supported
 
-### Quick Reference
-
-| Environment Variable | Config Key | Type Conversion |
-|---------------------|------------|-----------------|
-| `VLLM_ASCEND_BALANCE_SCHEDULING` | `scheduler_config.enable_balance_scheduling` | `"1"` → `true`, `"0"` → `false` |
-| `MSMONITOR_USE_DAEMON` | `msmonitor_use_daemon` | `"1"` → `true`, `"0"` → `false` |
-| `VLLM_ASCEND_ENABLE_MLAPO` | `enable_mlapo` | `"1"` → `true`, `"0"` → `false` |
-| `VLLM_ASCEND_ENABLE_NZ` | `weight_nz_mode` | Integer (unchanged, field name changed) |
-| `VLLM_ASCEND_ENABLE_FUSED_MC2` | `enable_fused_mc2` | Integer (unchanged) |
-| `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` | `enable_transpose_kv_cache_by_block` | `"1"` → `true`, `"0"` → `false` |
-
 ## How to use
 
 With either online mode or offline mode, users can use additional configuration. Take Qwen3 as an example:
@@ -125,13 +114,14 @@ The accepted fields depend on the model runner:
 
 - **Model Runner V2** accepts `load_collection_phase` and `stair_config` here.
   Configure upstream EPLB through `--enable-eplb` and `--eplb-config`. Ascend
-  uses the STAIR policy by default and asynchronous Gloo movement. Select
-  `default` or `stair` only through the upstream `--eplb-config.policy`
-  option. See the
-  [EPLB user guide](../feature_guide/expert_parallelism_load_balancer.md#advanced-stair-tuning)
+  uses the STAIR policy by default and moves expert weights asynchronously
+  over HIXL when it is available on every EPLB rank, falling back to Gloo
+  CPU staging otherwise. Select `default` or `stair` only through the
+  upstream `--eplb-config.policy` option. See the
+  [EPLB user guide](../feature_guide/expert_parallelism_load_balancer.md#tuning-suggestions)
   for the advanced STAIR fields and their defaults.
 - **Model Runner V1** accepts the legacy fields below except
-  `load_collection_phase`.
+  `load_collection_phase` and `stair_config`.
   MRv1 does not accept upstream `--enable-eplb` on Ascend.
 
 Mixing the two schemas fails during startup instead of silently ignoring
@@ -147,7 +137,8 @@ configuration.
 | `num_redundant_experts`          | int | `0`    | MRv1 only in this table. Configure the MRv2 value through upstream `--eplb-config`. |
 | `eplb_policy_type`               | int | `2`    | MRv1 only. EPLB policy: `0`=Random, `1`=DefaultEplb, `2`=SwiftBalanceEplb, `3`=FlashLB. |
 | `eplb_heat_collection_stage`     | str | `"all"`| MRv1 only. Select `"all"`, `"prefill"`, or `"decode"` heat collection. |
-| `load_collection_phase`          | str | `"all"`| MRv2 only. Select `"all"`, `"prefill"`, or `"decode"` load submission. Any batch containing a prefill request is classified entirely as prefill. |
+| `load_collection_phase`          | str | `"all"`| MRv2 only. Select `"all"`, `"prefill"`, or `"decode"` load collection. Only effective with the STAIR policy; a value other than `"all"` requires `--enable-eplb`. Any batch containing a prefill request is classified entirely as prefill. |
+| `stair_config`                   | dict | `{}`   | MRv2 only. Advanced STAIR policy tuning. See the [tuning suggestions table](../feature_guide/expert_parallelism_load_balancer.md#tuning-suggestions) for all fields, defaults, and ranges. |
 
 **scheduler_config**
 

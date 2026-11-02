@@ -35,14 +35,14 @@ KV Cache supports the following three external storage backends, choose the stor
 
     | Category | Constraints |
     | :--- | :--- |
-    | Software Dependencies | • Mooncake >= 0.3.11.post1 (non-default tenant requires >= 0.3.12).<br>• Mooncake wheel requires glibc >= 2.35. |
+    | Software Dependencies | • Mooncake >= 0.3.11.post1 (non-default tenant requires >= 0.3.12).<br>• Mooncake wheel requires glibc >= 2.35.<br>• Layerwise support requires Mooncake >= 0.3.14. |
     | Deployment | Supports both the PD Disaggregation and PD-Mixed scenarios, Store/PD traffic separation applies to A3 and 950PR&950DT Products. |
 
 === "Memcache backend"
 
     | Category | Constraints |
     | :--- | :--- |
-    | Software Dependencies | • Requires `memfabric-hybrid` and `memcache-hybrid` (SSD Cache needs `memcache_hybrid >= 1.2.0`).<br>• On A3, using `device_sdma` protocol requires LingQu Computing Network >= 1.5. |
+    | Software Dependencies | • Requires `memfabric-hybrid` and `memcache-hybrid` (SSD Cache needs `memcache_hybrid >= 1.2.0`).<br>• Layerwise support requires `memcache_hybrid >= 1.3.0`.<br>• On A3, using `device_sdma` protocol requires LingQu Computing Network >= 1.5. |
     | Deployment | Supports both the PD Disaggregation and PD-Mixed scenarios. [Separated deployment of MemCache and vLLM](#Memcache-and-vLLM-Separated-Deployment) is supported only on A3. |
 
 === "Yuanrong backend"
@@ -51,6 +51,16 @@ KV Cache supports the following three external storage backends, choose the stor
     | :--- | :--- |
     | Software Dependencies | Requires `openyuanrong-datasystem` |
     | Feature Mutex | • Worker cannot configure both Coordinator and etcd discovery backends simultaneously.<br>• Under `P2P_TRANSFER` or FabricMem mode, client-side device memory pre-registration is always skipped regardless of `enable_dev_mem_pregister` value. |
+
+### Upgrading Pools with Strided MLA Caches
+
+Bulk and layerwise pooling transfer MLA components in separate physical-block segments when a scheduler block contains multiple kernel blocks with gaps between their payloads. The components must be contiguous inside each physical block. Partial layerwise transfers copy only the token interval covered by each segment. Dense cache layouts retain their existing packed representation.
+
+Pool objects written by the older contiguous-range implementation are incompatible with the corrected representation for affected layouts, even though their total byte size is unchanged. Upgrade all writers and readers together, and invalidate the affected pool entries or use a fresh cache namespace. For request-level isolation, use a new `cache_salt` consistently for requests that should share cached prefixes. Restarting vLLM workers alone does not invalidate persisted pool objects.
+
+For non-layerwise complete-block transfers, adjacent MLA components sharing one backing storage are coalesced into one descriptor per physical page, or one descriptor per logical block when the pages have no gaps. Padding is never copied. Layerwise transfers, partial-chunk configurations, align-state groups, decode-cache saving, TP mismatch, DCP and KVPP retain the component-segment fallback. Registration logs report each coalesced layer and its descriptor count.
+
+This bulk fast path uses physical-page-major object contents instead of the previous component-major segmented contents. A fresh namespace is required even when upgrading from the earlier segmented version of this fix. Writers and readers must agree on transfer mode and cache layout; do not share these objects with layerwise readers or workers using a different component layout.
 
 ## Scenario 1: Mooncake Backend
 
@@ -593,7 +603,7 @@ done
 
 For MooncakeStore with `ASCEND_BUFFER_POOL` enabled, perform a warm-up phase before running actual performance benchmarks. Since HCCS one-sided communication connections are created lazily after instance launch, full-mesh connections incur a one-time overhead (4 MB device memory per connection). Warm-up recommendation: input sequence length 8k, output sequence length 1, total requests 2-3x number of devices.
 
-## Scenario 2: Memcache Backend
+## Scenario 2: Memcache Backend {: #scenario-2-memcache-backend }
 
 ### Configuration Examples
 
@@ -730,10 +740,10 @@ ock.mmc.evict_threshold_low = 60
 
 | `Parameter` | Type | Default | Required | Value Range | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `ock.mmc.meta_service_url` | str | tcp://127.0.0.1:5000 | No | tcp://<host>:<port>, port [1025, 65535] | MetaService address. P and D nodes must use the same endpoint. Host supports IP and domain. |
-| `ock.mmc.meta_service.config_store_url` | str | tcp://127.0.0.1:6000 | No | tcp://<host>:<port>, port [1025, 65535] | Config store URL. |
-| `ock.mmc.meta_service.metrics_url` | str | `http://127.0.0.1:8000` | No | http(s)://<host>:<port>, port [1025, 65535] | Metrics URL. |
-| `ock.mmc.log_level` | str | info | No | debug / info / warn / error | Log level; shared by MetaService and LocalService. |
+| `ock.mmc.meta_service_url` | str | tcp://127.0.0.1:5000 | Yes | tcp://<host>:<port>, port [1025, 65535] | MetaService address. P and D nodes must use the same endpoint. Host supports IP and domain. |
+| `ock.mmc.meta_service.config_store_url` | str | tcp://127.0.0.1:6000 | Yes | tcp://<host>:<port>, port [1025, 65535] | Config store URL. |
+| `ock.mmc.meta_service.metrics_url` | str | `http://127.0.0.1:8000` | Yes | http(s)://<host>:<port>, port [1025, 65535] | Metrics URL. |
+| `ock.mmc.log_level` | str | info | Yes | debug / info / warn / error | Log level; shared by MetaService and LocalService. |
 | `ock.mmc.evict_threshold_high` | int | 90 | No | [1, 99] (percentage) | High watermark of the secondary (L2) pool; eviction is triggered when this watermark is reached, and only when `usedSize * 100 > totalSize * threshold`. When SSD is enabled, 70 is recommended to improve SSD cache hit rate. |
 | `ock.mmc.evict_threshold_low` | int | 80 | No | [1, 98] (percentage) | Low watermark of the secondary (L2) pool; eviction stops at this watermark. When SSD is enabled, 60 is recommended. |
 
@@ -1543,7 +1553,7 @@ Refer to the verification operations in Steps 1–5 of Configuration Examples.
 
 ## Reference
 
-### kv-transfer-config Common Parameters
+### kv-transfer-config Common Parameters {: #kv-transfer-config-common-parameters }
 
 | `Parameter` | Type | Default | Required | Value Range | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -1569,7 +1579,7 @@ Refer to the verification operations in Steps 1–5 of Configuration Examples.
 | `comm_resource_config.listen_port` | int | 16666 | No | Port number | One-sided communication listen port. Use a different port for standalone `mooncake_client` processes to avoid conflicts with embedded clients. |
 | `fabric_memory.max_capacity` | int | No default | Only when fabric mem budget is insufficient | Integer (GB per process) | Fabric memory quota. |
 
-### HDK and CANN Version Compatibility Reference
+### HDK and CANN Version Compatibility Reference {: #hdk-and-cann-version-compatibility-reference }
 
 | Hardware Series | HDK Requirement | CANN Requirement | Other Dependencies |
 | :--- | :--- | :--- | :--- |
@@ -1624,7 +1634,7 @@ Public FAQ references:
 
 **Resolution Steps:**
 
-1. Identify the error source. If Mooncake-reported `put` failure, ensure eviction policy remaining space (e.g., `1 - eviction_ratio`) can hold one batch put, or increase capacity, increase eviction headroom, or reduce batch size.
+1. Identify the error source. If Mooncake-reported `put` failure, ensure eviction policy remaining space (e.g., `--eviction_ratio`) can hold one batch put, or increase capacity, increase eviction headroom, or reduce batch size.
 2. If `get` failure, increase `mooncake_master` `--default_kv_lease_ttl` and keep it larger than `ASCEND_CONNECT_TIMEOUT` and `ASCEND_TRANSFER_TIMEOUT`.
 3. If not Mooncake-reported, it is likely an HIXL (ascend_direct) transfer-layer issue. Collect plog files under `/root/ascend/log/debug/plog` for investigation.
 
