@@ -5,7 +5,9 @@ default_install_hook_types:
 default_stages:
   - pre-commit # Run locally
   - manual # Run in CI
-exclude: '^(\.agents|\.claude|\.gemini)/.*'
+# Preserve immutable upstream snapshots used by the hash-checked PP/MTP patch tool.
+# The executable helper and regression scripts remain covered by all normal hooks.
+exclude: '^(?:(?:\.agents|\.claude|\.gemini)/.*|tools/ling_mxfp/pp_mtp_embedding/(?:before|after)\.py)$'
 
 repos:
 - repo: https://github.com/astral-sh/ruff-pre-commit
