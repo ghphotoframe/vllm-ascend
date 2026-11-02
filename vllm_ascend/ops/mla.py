@@ -116,6 +116,28 @@ class IndexerWrapper(nn.Module):
         )
 
 
+class _OutputProjectionWithoutPrefillHint(nn.Module):
+    """Preserve an upstream identity projection's tuple result and width."""
+
+    def __init__(self, projection: nn.Module) -> None:
+        super().__init__()
+        self.projection = projection
+
+    def forward(self, hidden_states: torch.Tensor, *, is_prefill: bool = False):
+        del is_prefill
+        return self.projection(hidden_states)
+
+
+def _adapt_mla_output_projection(projection: nn.Module) -> nn.Module:
+    # Ling keeps its real dense projection outside MLA. The newer Ascend
+    # backend passes an optional prefill hint; the weightless upstream
+    # placeholder has no such keyword. Do not wrap ordinary linear methods.
+    cls = type(projection)
+    if cls.__module__ == "vllm.model_executor.models.bailing_moe_v3" and cls.__name__ == "_IdentityProjection":
+        return _OutputProjectionWithoutPrefillHint(projection)
+    return projection
+
+
 class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
     @property
     def supports_sequence_parallel_input(self) -> bool:
@@ -250,7 +272,7 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             q_proj=mla_modules.q_proj,
             kv_a_proj_with_mqa=mla_modules.kv_a_proj_with_mqa,
             kv_a_layernorm=mla_modules.kv_a_layernorm,
-            o_proj=mla_modules.o_proj,
+            o_proj=_adapt_mla_output_projection(mla_modules.o_proj),
             g_proj=mla_modules.g_proj,
             use_mla_rope=mla_modules.rotary_emb is not None,
             layer_name=f"{prefix}.attn",
