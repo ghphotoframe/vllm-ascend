@@ -71,6 +71,19 @@ def _make_mx_scale_weight_loader(
     return mx_scale_weight_loader
 
 
+def _make_block_scale_weight_loader(weight_loader):
+    def load_block_scale(param, loaded_weight, *args, **kwargs):
+        # A small output projection can share a single 128-row scale tile
+        # across all TP ranks. The complete scale already has the local shape.
+        # Keep packed/stacked shards on their original loader path.
+        if not args and not kwargs and loaded_weight.shape == param.shape:
+            param.data.copy_(loaded_weight)
+            return None
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return load_block_scale
+
+
 class AscendLinearMethod(LinearMethodBase):
     """Linear method for Ascend quantization.
 
@@ -164,6 +177,7 @@ class AscendLinearMethod(LinearMethodBase):
                 )
                 layer.register_parameter(pergroup_name, param)
                 set_weight_attrs(param, _forwardable_weight_attrs(extra_weight_attrs))
+                param.weight_loader = _make_block_scale_weight_loader(weight_loader)
                 continue
             param = torch.nn.Parameter(pergroup_param, requires_grad=False)
             set_weight_attrs(param, {"output_dim": 0})

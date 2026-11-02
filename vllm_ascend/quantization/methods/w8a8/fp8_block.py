@@ -211,7 +211,17 @@ class AscendFp8BlockLinearMethod(AscendLinearScheme):
             # splits this layer and disposes of it, so apply() is never reached
             # and nothing about this layer should speak for any other.
             layer.weight = torch.nn.Parameter(maybe_trans_nz(resolved), requires_grad=False)
+            # The tensor is now dense, and MLA validates this before absorbing it.
+            # Keep other block-FP8 layers on their original quantized path.
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+            layer.quant_method = UnquantizedLinearMethod()
             return
+
+        if getattr(layer, "prefix", "").endswith(".g_proj") and resolved.shape[0] < self.block_n:
+            # The small shared-tile gate is cheap to keep dense. Preserve the
+            # original block-FP8 values rather than requantizing them to MXFP8.
+            self.mxfp8_method = None
 
         if self.mxfp8_method is not None and not _supports_mx_regroup(resolved.shape[1], self.mxfp8_method.group_size):
             logger.warning_once(
