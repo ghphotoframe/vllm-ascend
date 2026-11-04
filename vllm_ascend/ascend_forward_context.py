@@ -360,7 +360,9 @@ def _select_capacity_and_world_size_moe_comm_method(
                 # quantized weight layouts. An unquantized (or unsupported-quantized)
                 # MTP draft MoE layer must skip FUSED_MC2 and fall through to the
                 # original MoE path (MC2/ALLGATHER/ALLTOALL) below.
-                pass
+                # The target's MegaMoe buffer can exceed ordinary MC2's
+                # 512-token-per-rank limit; do not reuse that larger capacity.
+                mc2_tokens_capacity = get_staged_mc2_tokens_capacity(vllm_config)
             else:
                 return MoECommType.FUSED_MC2
     num_experts_per_tok = getattr(

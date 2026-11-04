@@ -461,10 +461,12 @@ class FusedMC2CommImpl(MoECommMethod):
             num_max_tokens_per_rank,
             num_topk,
             hidden=self.moe_config.hidden_dim,
+            # CANN expects the post-activation width I, not the gate/up
+            # projection width 2I (or a packed quantized storage dimension).
             intermediate_hidden=(
                 intermediate_hidden
                 if intermediate_hidden is not None
-                else 2 * self.moe_config.intermediate_size_per_partition
+                else self.moe_config.intermediate_size_per_partition
             ),
             max_recv_token_num=max_recv_token_num,
             dispatch_quant_mode=dispatch_quant_mode,
@@ -509,8 +511,8 @@ class FusedMC2CommImpl(MoECommMethod):
         if self.mega_moe_symm_buffer is None:
             # BF16 ND weights may have a padded physical I while moe_config
             # retains the checkpoint's logical I. Quantized layouts keep their
-            # existing metadata rules (including packed INT4 dimensions).
-            intermediate_hidden = weight1[0].shape[-1] if weight1[0].dtype == torch.bfloat16 else None
+            # logical config width instead of inferring I from packed storage.
+            intermediate_hidden = weight1[0].shape[-1] // 2 if weight1[0].dtype == torch.bfloat16 else None
             self.mega_moe_symm_buffer = self._init_mega_moe_symm_buffer(
                 dispatch_quant_mode,
                 dispatch_quant_out_dtype,

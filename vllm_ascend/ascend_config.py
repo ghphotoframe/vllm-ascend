@@ -1210,6 +1210,13 @@ class AscendConfig:
         supported_intermediate_sizes = {1024, 2048, 3072, 4096, 7168}
         if is_minimax_m3 or is_kimi_k3:
             supported_intermediate_sizes.add(6144)
+        if "BailingMoeV3ForCausalLM" in model_architectures:
+            # Ling-3.1 uses I=1280 (gate/up width 2560). Ascend 950's MXFP
+            # MegaMoe supports activation width I in [256, 4096], aligned to
+            # 128; this checkpoint needs no padding or FP4/scale repacking.
+            # Keep the additional shape scoped to the model exercised by the
+            # H=4096, I=1280 W4A8-MXFP operator regression.
+            supported_intermediate_sizes.add(2560)
         # intermediate_hidden == l1_weights.dim1 == 2 * moe_intermediate_size.
         intermediate_hidden = 2 * int(moe_intermediate_size)
         if intermediate_hidden not in supported_intermediate_sizes:

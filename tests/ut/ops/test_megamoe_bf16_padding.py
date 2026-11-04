@@ -165,8 +165,17 @@ def test_postload_produces_contiguous_expert_lists(monkeypatch, a3_profile, padd
     assert views[1] is layer.w2_weight_list
 
 
-@pytest.mark.parametrize("dtype, expected_physical", [(torch.bfloat16, 2048), (torch.int8, None)])
-def test_cann_initialization_uses_physical_bf16_intermediate(monkeypatch, a3_profile, dtype, expected_physical):
+@pytest.mark.parametrize(
+    "dtype, quant_type, expected_physical",
+    [
+        (torch.bfloat16, QuantType.NONE, 1024),
+        (torch.int8, QuantType.W8A8, None),
+        (torch.uint8, QuantType.W4A8MXFP, None),
+    ],
+)
+def test_cann_initialization_uses_physical_bf16_intermediate(
+    monkeypatch, a3_profile, dtype, quant_type, expected_physical
+):
     comm = object.__new__(FusedMC2CommImpl)
     comm.token_dispatcher = object.__new__(TokenDispatcherWithMC2)
     comm.token_dispatcher.max_num_tokens_per_rank = 1024
@@ -179,16 +188,21 @@ def test_cann_initialization_uses_physical_bf16_intermediate(monkeypatch, a3_pro
         hidden_states=torch.zeros(1, 8, dtype=torch.bfloat16),
         topk_ids=torch.zeros(1, 2, dtype=torch.int32),
         topk_weights=torch.ones(1, 2),
-        quant=SimpleNamespace(quant_type=QuantType.NONE if dtype == torch.bfloat16 else QuantType.W8A8),
+        quant=SimpleNamespace(quant_type=quant_type),
         routing=SimpleNamespace(mc2_mask=None),
         layer=SimpleNamespace(mega_moe_activation_kwargs={}),
     )
-    weights = MoEWeights(w1=[torch.zeros(8, 2048, dtype=dtype)], w2=[torch.zeros(1024, 8, dtype=dtype)])
+    if dtype == torch.uint8:
+        # A5 packed FP4 [2I, H/2] and [H, I/2] must not be interpreted
+        # like the transposed, unpacked BF16 [H, 2I] and [I, H] layouts.
+        weights = MoEWeights(w1=[torch.zeros(2048, 4, dtype=dtype)], w2=[torch.zeros(8, 512, dtype=dtype)])
+    else:
+        weights = MoEWeights(w1=[torch.zeros(8, 2048, dtype=dtype)], w2=[torch.zeros(1024, 8, dtype=dtype)])
     comm._apply_cann_mega_moe(inp, weights, is_decode_only_node=False)
     assert comm._init_mega_moe_symm_buffer.call_args.kwargs["intermediate_hidden"] == expected_physical
 
 
-@pytest.mark.parametrize("physical, expected", [(None, 1536), (2048, 2048)])
+@pytest.mark.parametrize("physical, expected", [(None, 768), (1024, 1024)])
 def test_symm_buffer_receives_physical_size_without_mutating_config(monkeypatch, physical, expected):
     comm = object.__new__(FusedMC2CommImpl)
     comm.moe_config = SimpleNamespace(

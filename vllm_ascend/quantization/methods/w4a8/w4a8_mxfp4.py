@@ -558,10 +558,15 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         layer = mlp_compute_input.layer
         assert layer is not None
         w1, w1_scale, _, _ = self._get_mlp_weights(layer)
+        # Packed MXFP4 weights require the weight antiquant scale and explicit
+        # FP8/FP4 semantics, just like the fused-activation and GMM2 paths.
+        # Passing these bytes as `scale` dispatches the legacy WeightNz op,
+        # which rejects the A5 FRACTAL_NZ_C0_16 storage format.
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=w1,
-            scale=w1_scale,
+            scale=None,
+            antiquant_scale=w1_scale,
             per_token_scale=[pertoken_scale],
             bias=None,
             split_item=2,
@@ -569,7 +574,8 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             group_list=mlp_compute_input.group_list,
             group_list_type=mlp_compute_input.group_list_type,
             output_dtype=torch.bfloat16,
-            scale_dtype=torch_npu.float8_e8m0fnu,
+            x_dtype=torch.float8_e4m3fn,
+            weight_dtype=torch_npu.float4_e2m1fn_x2,
             per_token_scale_dtype=torch_npu.float8_e8m0fnu,
         )[0]
         dispose_tensor(mlp_compute_input.hidden_states)

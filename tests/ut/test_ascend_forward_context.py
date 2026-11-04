@@ -547,20 +547,28 @@ def test_select_moe_comm_method_a5_uses_megamoe_when_enabled(monkeypatch, num_to
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == MoECommType.FUSED_MC2
 
 
-@pytest.mark.parametrize("num_tokens", [128, 4096])
-@pytest.mark.parametrize("draft_quant", [QuantType.NONE, QuantType.W8A8MXFP, QuantType.W4A8MXFP, QuantType.W4A4MXFP])
-def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_tokens, draft_quant):
+@pytest.mark.parametrize("num_tokens", [128, 2048, 2049, 8192])
+@pytest.mark.parametrize("capacity", [128, 8192])
+@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize(
+    "draft_quant", [QuantType.NONE, QuantType.W8A8FP, QuantType.W8A8MXFP, QuantType.W4A8MXFP, QuantType.W4A4MXFP]
+)
+def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_tokens, capacity, top_k, draft_quant):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=AscendDeviceType.A5,
-        capacity=128,
+        capacity=capacity,
+        ep_world_size=4,
         enable_fused_mc2=1,
     )
     monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
-    vllm_config = _make_vllm_config(world_size=8, top_k_experts=4)
+    vllm_config = _make_vllm_config(world_size=8, pipeline_parallel_size=2, tensor_parallel_size=4, top_k_experts=top_k)
     expected = MoECommType.FUSED_MC2
-    if draft_quant == QuantType.NONE:
-        expected = MoECommType.MC2 if num_tokens <= 128 else MoECommType.ALLTOALL
+    if draft_quant in (QuantType.NONE, QuantType.W8A8FP):
+        # Unsupported drafts use ordinary MC2, whose token capacity remains
+        # 512/rank even when the target reserves a larger MegaMoE buffer.
+        fallback = MoECommType.ALLGATHER if top_k == 8 else MoECommType.ALLTOALL
+        expected = MoECommType.MC2 if num_tokens <= min(capacity, 512 * 4) else fallback
     assert (
         afc.select_moe_comm_method(num_tokens, vllm_config, is_draft_model=True, draft_moe_quant_type=draft_quant)
         == expected
