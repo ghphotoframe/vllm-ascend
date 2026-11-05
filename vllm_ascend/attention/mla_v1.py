@@ -2044,7 +2044,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not self.fa_quant_layer
             and not self.enable_kv_nz
             and not self.pcp_enabled
-            and not self.dcp_enabled
+            # DCP masks non-owned cache slots with -1, but the bounded writer
+            # still returns every current KV row for prefill. Single-token
+            # decode reads paged KV, so it can share this workspace with
+            # prefill. Speculative/draft decode can retain current-KV views
+            # across prefill and would need separate workspaces.
+            and (not self.dcp_enabled or (self.speculative_config is None and not self.is_draft_model))
         ):
             return True
         # Preserve the existing A5 wide-draft admission for other models.

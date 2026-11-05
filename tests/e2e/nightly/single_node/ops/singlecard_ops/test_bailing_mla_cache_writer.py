@@ -19,9 +19,10 @@ FUSED_DIM = NOPE_DIM + ROPE_DIM
 SENTINEL = -37
 
 
-def _impl():
+def _impl(dcp_enabled=False):
     torch.npu.set_device(0)
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.layer_name = "model.layers.0.self_attn.attn"
     impl.rotary_emb = SimpleNamespace(uses_mla_mrope=True)
     impl.q_lora_rank = impl.fused_qkv_a_proj = impl.q_a_layernorm = None
     impl.support_fp8_attention = impl.is_draft_model = False
@@ -29,6 +30,8 @@ def _impl():
     impl.dtype = torch.bfloat16
     impl.kv_lora_rank, impl.qk_rope_head_dim, impl.num_kv_heads = NOPE_DIM, ROPE_DIM, 1
     impl.fa_quant_layer = impl.enable_kv_nz = impl.pcp_enabled = impl.dcp_enabled = False
+    impl.dcp_enabled = dcp_enabled
+    impl.speculative_config = None
     impl.kv_a_layernorm = SimpleNamespace(
         weight=torch.rand(NOPE_DIM, dtype=impl.dtype, device="npu"), variance_epsilon=1e-6
     )
@@ -97,9 +100,10 @@ def _expected_backing(backing, cache, slots, reference):
 @pytest.mark.parametrize("layout", ["component_major", "token_fused"])
 @pytest.mark.parametrize("offset", [0, 16])
 @pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("dcp_enabled", [False, True])
 @torch.inference_mode()
-def test_direct_q_writer_preserves_padding_and_original_storage(layout, offset, prefill):
-    impl = _impl()
+def test_direct_q_writer_preserves_padding_and_original_storage(layout, offset, prefill, dcp_enabled):
+    impl = _impl(dcp_enabled=dcp_enabled)
     backing, cache = _cache(layout, offset=offset)
     kv, cos, sin, slots = _inputs()
     if (
@@ -130,9 +134,10 @@ def test_direct_q_writer_preserves_padding_and_original_storage(layout, offset, 
 
 
 @pytest.mark.parametrize("layout", ["component_major", "token_fused"])
+@pytest.mark.parametrize("dcp_enabled", [False, True])
 @torch.inference_mode()
-def test_direct_q_writer_graph_replay_updates_slots_and_skips_all_padding(layout):
-    impl = _impl()
+def test_direct_q_writer_graph_replay_updates_slots_and_skips_all_padding(layout, dcp_enabled):
+    impl = _impl(dcp_enabled=dcp_enabled)
     backing, cache = _cache(layout)
     kv, cos, sin, slots = _inputs()
     if (
@@ -160,9 +165,10 @@ def test_direct_q_writer_graph_replay_updates_slots_and_skips_all_padding(layout
         torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dcp_enabled", [False, True])
 @torch.inference_mode()
-def test_direct_q_writer_temporary_memory_does_not_scale_with_history_pool():
-    impl = _impl()
+def test_direct_q_writer_temporary_memory_does_not_scale_with_history_pool(dcp_enabled):
+    impl = _impl(dcp_enabled=dcp_enabled)
     kv, cos, sin, slots = _inputs()
     peaks = []
     for blocks in (128, 2048):

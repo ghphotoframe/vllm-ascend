@@ -100,7 +100,8 @@ def test_upstream_custom_op_calls_ascend_forward_with_g1_keyword():
 
 
 @pytest.mark.parametrize("separate_b_proj", [False, True])
-def test_forward_passes_raw_gate_and_fp32_sigmoid_beta(separate_b_proj: bool):
+@pytest.mark.parametrize("flash_kda_enabled", [False, True])
+def test_forward_passes_raw_gate_and_backend_beta(separate_b_proj: bool, flash_kda_enabled: bool):
     attention = _new_attention()
     num_tokens, num_heads, head_dim = 4, 2, 3
     projection_size = num_heads * head_dim
@@ -134,11 +135,10 @@ def test_forward_passes_raw_gate_and_fp32_sigmoid_beta(separate_b_proj: bool):
 
     hidden_states = torch.randn(num_tokens, 7, dtype=torch.bfloat16)
     output = torch.empty(num_tokens, projection_size)
-    with patch.object(
-        torch.ops.vllm,
-        "bailing_v3_kda_attention",
-        create=True,
-    ) as custom_op:
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
+        patch.object(torch.ops.vllm, "bailing_v3_kda_attention", create=True) as custom_op,
+    ):
         result = attention.forward(hidden_states, torch.arange(num_tokens), output)
 
     assert result is None
@@ -148,8 +148,9 @@ def test_forward_passes_raw_gate_and_fp32_sigmoid_beta(separate_b_proj: bool):
     torch.testing.assert_close(k_arg, expected_k)
     torch.testing.assert_close(v_arg, expected_v)
     torch.testing.assert_close(gate_arg, raw_gate.reshape(1, num_tokens, num_heads, head_dim))
-    assert beta_arg.dtype == torch.float32
-    torch.testing.assert_close(beta_arg, beta_logits.float().sigmoid().unsqueeze(0))
+    expected_beta = beta_logits if flash_kda_enabled else beta_logits.float().sigmoid()
+    assert beta_arg.dtype == expected_beta.dtype
+    torch.testing.assert_close(beta_arg, expected_beta.unsqueeze(0))
     assert tuple(core_arg.shape) == (1, num_tokens, num_heads, head_dim)
     assert prefix_arg == attention.prefix
     assert attention.o_norm.inputs is not None
@@ -160,7 +161,10 @@ def test_forward_passes_raw_gate_and_fp32_sigmoid_beta(separate_b_proj: bool):
     ("safe_gate", "expected_lower_bound"),
     [(False, None), (True, -4.0)],
 )
-def test_recurrent_uses_current_kda_contract(safe_gate: bool, expected_lower_bound: float | None):
+@pytest.mark.parametrize("flash_kda_enabled", [False, True])
+def test_recurrent_uses_current_kda_contract(
+    safe_gate: bool, expected_lower_bound: float | None, flash_kda_enabled: bool
+):
     attention = _new_attention()
     attention.safe_gate = safe_gate
     attention.lower_bound = -4.0
@@ -170,16 +174,17 @@ def test_recurrent_uses_current_kda_contract(safe_gate: bool, expected_lower_bou
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_gate = torch.randn_like(q)
-    beta = torch.rand(1, 3, 1)
+    beta_logits = torch.tensor([-8.0, 0.0, 8.0], dtype=torch.bfloat16).reshape(1, 3, 1)
+    beta = beta_logits if flash_kda_enabled else beta_logits.float().sigmoid()
     recurrent_state = torch.zeros(4, 1, 2, 2)
     cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
     state_indices = torch.tensor([2], dtype=torch.int32)
     accepted = torch.tensor([2], dtype=torch.int32)
 
-    with patch(
-        "vllm_ascend.ops.bailing_moe_v3_kda.run_recurrent_kda",
-        return_value=v,
-    ) as run_recurrent:
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.run_recurrent_kda", return_value=v) as run_recurrent,
+    ):
         actual = attention._run_recurrent(
             q,
             k,
@@ -206,8 +211,12 @@ def test_recurrent_uses_current_kda_contract(safe_gate: bool, expected_lower_bou
         attention.dt_bias,
     )
     assert len(run_recurrent.call_args.args) == len(expected_args)
-    for actual_arg, expected_arg in zip(run_recurrent.call_args.args, expected_args):
-        assert actual_arg is expected_arg
+    for index, (actual_arg, expected_arg) in enumerate(zip(run_recurrent.call_args.args, expected_args)):
+        if index == 4:
+            assert actual_arg.dtype == torch.float32
+            torch.testing.assert_close(actual_arg, beta_logits.float().sigmoid())
+        else:
+            assert actual_arg is expected_arg
     assert run_recurrent.call_args.kwargs["lower_bound"] == expected_lower_bound
     assert run_recurrent.call_args.kwargs["num_accepted_tokens"] is accepted
 
@@ -380,6 +389,53 @@ def test_prefill_requires_initial_state_metadata():
     state_copy.gather.assert_not_called()
     state_copy.scatter.assert_not_called()
     run_chunk.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_reuses_batch_cu_across_layers_without_changing_ascendc(enabled):
+    attention = _new_attention()
+    attention.safe_gate, attention.lower_bound = True, -5.0
+    attention.A_log, attention.dt_bias = torch.zeros(1), torch.zeros(2)
+    attention._kda_state_copy_ready = True
+    state = torch.zeros(1, 1, 2, 2)
+    attention._ascend_kda_state_copy = SimpleNamespace(gather=MagicMock(return_value=state), scatter=MagicMock())
+    q = torch.zeros(1, 3, 1, 2)
+    prepared = torch.tensor([0, 3], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        cu_seqlens_host=(0, 3),
+        cu_seqlens_kern=None,
+        keep_meta=None,
+        chunk_indices_chunk64_host=(0, 0),
+        flash_cu_seqlens=prepared,
+    )
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", enabled),
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.run_chunk_kda", return_value=(q, state)) as run_chunk,
+    ):
+        assert attention.get_attn_backend().get_builder_cls().build_flash_kda_cu_seqlens is enabled
+        for _ in range(3):
+            attention._run_prefill(q, q, q, q, q, state, torch.tensor([0]), torch.tensor([True]), metadata)
+        for call in run_chunk.call_args_list:
+            assert call.args[6] is metadata.cu_seqlens_host
+            if enabled:
+                assert call.kwargs["cu_seqlens_device"] is prepared
+            else:
+                assert "cu_seqlens_device" not in call.kwargs
+
+
+def test_flash_prefill_requires_prebuilt_device_cu():
+    attention = _new_attention()
+    attention.safe_gate, attention.lower_bound = True, -5.0
+    state = torch.zeros(1, 1, 2, 2)
+    attention._kda_state_copy_ready = True
+    attention._ascend_kda_state_copy = SimpleNamespace(gather=MagicMock(return_value=state), scatter=MagicMock())
+    q = torch.zeros(1, 3, 1, 2)
+    metadata = SimpleNamespace(cu_seqlens_host=(0, 3), cu_seqlens_kern=None, keep_meta=None, flash_cu_seqlens=None)
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", True),
+        pytest.raises(RuntimeError, match="batch device cu_seqlens"),
+    ):
+        attention._run_prefill(q, q, q, q, q, state, torch.tensor([0]), torch.tensor([True]), metadata)
 
 
 @pytest.mark.parametrize("layout", ["sd", "ds", "page_strided"])

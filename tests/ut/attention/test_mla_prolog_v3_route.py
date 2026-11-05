@@ -424,9 +424,9 @@ def test_constructor_initializes_parallel_routing_flags(
     assert impl.is_pcp_decode_sharded is (expected_pcp and dcp_size == 1)
 
 
-def _component_major_cache(blocks: int = 4):
+def _component_major_cache(blocks: int = 4, dtype=torch.float32):
     page = BLOCK_SIZE * FUSED_DIM
-    raw = torch.arange(blocks * 2 * page, dtype=torch.float32).reshape(blocks * 2, page)
+    raw = torch.arange(blocks * 2 * page, dtype=torch.float32).to(dtype).reshape(blocks * 2, page)
     nope = raw.as_strided(
         (blocks, BLOCK_SIZE, 1, NOPE_DIM),
         (2 * page, NOPE_DIM, NOPE_DIM, 1),
@@ -440,8 +440,9 @@ def _component_major_cache(blocks: int = 4):
     return nope, rope
 
 
-def _token_fused_cache(blocks: int = 4):
-    fused = torch.arange(blocks * BLOCK_SIZE * FUSED_DIM, dtype=torch.float32).reshape(blocks, BLOCK_SIZE, 1, FUSED_DIM)
+def _token_fused_cache(blocks: int = 4, dtype=torch.float32):
+    fused = torch.arange(blocks * BLOCK_SIZE * FUSED_DIM, dtype=torch.float32).to(dtype)
+    fused = fused.reshape(blocks, BLOCK_SIZE, 1, FUSED_DIM)
     nope = fused[..., :NOPE_DIM]
     rope = fused[..., NOPE_DIM:]
     return nope, rope
@@ -1374,6 +1375,7 @@ def _make_mrope_direct_q_impl():
     impl.q_a_layernorm = None
     impl.support_fp8_attention = False
     impl.is_draft_model = False
+    impl.speculative_config = None
     return impl
 
 
@@ -1381,7 +1383,6 @@ def _make_mrope_direct_q_impl():
     "attribute,value",
     [
         ("pcp_enabled", True),
-        ("dcp_enabled", True),
         ("enable_kv_nz", True),
         ("fa_quant_layer", True),
         ("use_mla_rope", False),
@@ -1399,6 +1400,31 @@ def test_mrope_direct_q_adapter_preserves_other_writer_contracts(attribute, valu
     impl._prepare_strided_kv_workspace()
     assert not impl._uses_strided_kv_adapter()
     assert impl._strided_kv_workspace is None
+
+
+@pytest.mark.parametrize(
+    "dcp_enabled,pcp_enabled,is_draft,speculative_config,expected",
+    [
+        (False, False, True, SimpleNamespace(num_speculative_tokens=3), True),
+        (True, False, False, None, True),
+        (True, True, False, None, False),
+        (True, False, True, None, False),
+        (True, False, False, SimpleNamespace(num_speculative_tokens=3), False),
+        (True, False, False, SimpleNamespace(num_speculative_tokens=0), False),
+    ],
+)
+def test_mrope_dcp_adapter_only_admits_non_speculative_target(
+    dcp_enabled, pcp_enabled, is_draft, speculative_config, expected
+):
+    impl = _make_mrope_direct_q_impl()
+    impl.dcp_enabled = dcp_enabled
+    impl.pcp_enabled = pcp_enabled
+    impl.is_draft_model = is_draft
+    impl.speculative_config = speculative_config
+    assert impl._uses_strided_kv_adapter() is expected
+    impl._prepare_strided_kv_workspace()
+    assert (impl._strided_kv_workspace is not None) is expected
+    assert not impl.supports_prolog_v3_writer()
 
 
 @pytest.mark.parametrize("input_size", [7168, 8192, 14336, None])
@@ -1472,13 +1498,25 @@ def test_wide_draft_weight_loading_prepares_workspace_without_prolog_weights(imp
 @pytest.mark.parametrize("impl_factory", [_make_wide_draft_impl, _make_mrope_direct_q_impl])
 def test_wide_draft_adapter_writes_original_storage_and_skips_padding(cache_factory, prefill, impl_factory):
     impl = impl_factory()
+    _check_bounded_writer_current_rows_and_history(impl, cache_factory, prefill, [0, BLOCK_SIZE - 1, BLOCK_SIZE, -1])
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("slot_values", [[-1, 0, -1, BLOCK_SIZE], [-1, -1, -1, -1]])
+def test_mrope_dcp_writer_returns_non_owned_current_rows_without_writing_history(prefill, slot_values):
+    impl = _make_mrope_direct_q_impl()
+    impl.dcp_enabled = True
+    _check_bounded_writer_current_rows_and_history(impl, _component_major_cache, prefill, slot_values)
+
+
+def _check_bounded_writer_current_rows_and_history(impl, cache_factory, prefill, slot_values):
     impl._prepare_strided_kv_workspace()
-    cache = cache_factory()
+    cache = cache_factory(dtype=impl.dtype)
     base = torch.empty(0, dtype=cache[0].dtype).set_(
         cache[0].untyped_storage(), 0, (cache[0].untyped_storage().nbytes() // cache[0].element_size(),), (1,)
     )
     expected = base.clone()
-    slots = torch.tensor([0, BLOCK_SIZE - 1, BLOCK_SIZE, -1])
+    slots = torch.tensor(slot_values)
     kv = torch.randn(4, FUSED_DIM, dtype=torch.bfloat16)
     cos, sin = torch.randn(4, ROPE_DIM), torch.randn(4, ROPE_DIM)
     normalized = kv[:, :NOPE_DIM].float()

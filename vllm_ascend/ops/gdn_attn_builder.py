@@ -128,6 +128,10 @@ class GDNChunkedPrefillMetadata:
     num_decodes: int = 0
     cu_seqlens_kern: tuple[int, ...] | None = None
     keep_meta: torch.Tensor | None = None
+    flash_cu_seqlens: torch.Tensor | None = None
+    # Keep the async H2D source alive with this batch, without reusing a
+    # mutable builder buffer while earlier layers/batches may still consume it.
+    flash_cu_seqlens_cpu: torch.Tensor | None = None
 
 
 @dataclass
@@ -271,6 +275,7 @@ def _build_non_spec_chunked_prefill_metadata(
     cu_seqlens_cpu: torch.Tensor,
     device: torch.device,
     build_device_metadata: bool = True,
+    build_flash_cu_seqlens: bool = False,
 ) -> GDNChunkedPrefillMetadata:
     chunk_indices_chunk64 = prepare_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
     if build_device_metadata:
@@ -306,6 +311,18 @@ def _build_non_spec_chunked_prefill_metadata(
     else:
         cu_seqlens_kern = tuple(cu_seqlens_kern)
 
+    flash_cu_seqlens_cpu = None
+    flash_cu_seqlens = None
+    if build_flash_cu_seqlens:
+        # These are the *prefill-only, compacted* boundaries also used to
+        # gather state. Construct/copy once on the metadata build stream, then
+        # all layers in this attention group consume the same batch tensor.
+        flash_cu_host = cu_seqlens_host if cu_seqlens_kern is None else cu_seqlens_kern
+        flash_cu_seqlens_cpu = torch.tensor(
+            flash_cu_host, dtype=torch.int64, device="cpu", pin_memory=device.type != "cpu"
+        )
+        flash_cu_seqlens = flash_cu_seqlens_cpu.to(device=device, non_blocking=True)
+
     if build_device_metadata:
         device_chunk_metadata = {
             "chunk_indices_chunk64": chunk_indices_chunk64.to(device=device, non_blocking=True),
@@ -331,12 +348,15 @@ def _build_non_spec_chunked_prefill_metadata(
         **device_chunk_metadata,
         cu_seqlens_kern=cu_seqlens_kern,
         keep_meta=keep_meta,
+        flash_cu_seqlens=flash_cu_seqlens,
+        flash_cu_seqlens_cpu=flash_cu_seqlens_cpu,
     )
 
 
 class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     build_device_chunk_metadata = True
+    build_flash_kda_cu_seqlens = False
 
     def __init__(
         self,
@@ -907,6 +927,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     prefill_query_start_loc_cpu,
                     query_start_loc.device,
                     build_device_metadata=self.build_device_chunk_metadata,
+                    build_flash_cu_seqlens=self.build_flash_kda_cu_seqlens,
                 )
                 # Common GDN/KDA callers also consume the upstream chunk fields.
                 chunk_indices = non_spec_chunked_prefill_metadata.chunk_indices_chunk64
@@ -994,6 +1015,18 @@ class AscendGDNAttentionBackend(GDNAttentionBackend):
     @staticmethod
     def get_builder_cls() -> type[AscendGDNAttentionMetadataBuilder]:
         return AscendGDNAttentionMetadataBuilder
+
+
+class AscendFlashKDAMetadataBuilder(AscendGDNAttentionMetadataBuilder):
+    """Opt only FlashKDA consumers into batch-owned INT64 varlen metadata."""
+
+    build_flash_kda_cu_seqlens = True
+
+
+class AscendFlashKDAAttentionBackend(AscendGDNAttentionBackend):
+    @staticmethod
+    def get_builder_cls() -> type[AscendFlashKDAMetadataBuilder]:
+        return AscendFlashKDAMetadataBuilder
 
 
 class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
