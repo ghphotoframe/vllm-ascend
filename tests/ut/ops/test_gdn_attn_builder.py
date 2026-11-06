@@ -18,6 +18,8 @@ from vllm_ascend.ops import gdn as ascend_gdn
 from vllm_ascend.ops import gdn_attn_builder as ascend_gdn_attn_builder
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.ops.gdn_attn_builder import (
+    AscendFlashKDAAttentionBackend,
+    AscendFlashKDAMetadataBuilder,
     AscendGDNAttentionBackend,
     AscendGDNAttentionMetadataBuilder,
     AscendGDNFusedAttentionBackend,
@@ -452,6 +454,85 @@ def test_host_builder_exposes_host_descriptors_without_device_chunks():
     assert chunk_meta.chunk_indices_chunk64_host
     assert attn_metadata.chunk_indices is None
     assert attn_metadata.chunk_offsets is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("cu", [(0, 32768), (0, 63, 128), (0, 63, 63, 128), (0, 0, 63, 63, 128, 128)])
+def test_flash_cu_builds_once_after_empty_segment_compaction(enabled, cu):
+    # The host-only chunk branch keeps this contract independent of Triton
+    # kernels and of the model's head count/TP degree.
+    original_tensor = torch.tensor
+    with patch.object(ascend_gdn_attn_builder.torch, "tensor", wraps=original_tensor) as tensor:
+        chunk = ascend_gdn_attn_builder._build_non_spec_chunked_prefill_metadata(
+            SimpleNamespace(),
+            original_tensor(cu, dtype=torch.int32),
+            torch.device("cpu"),
+            build_device_metadata=False,
+            build_flash_cu_seqlens=enabled,
+        )
+    materializations = [call for call in tensor.call_args_list if "pin_memory" in call.kwargs]
+    assert len(materializations) == int(enabled)
+    if enabled:
+        expected = [0] + [end for start, end in zip(cu, cu[1:]) if end > start]
+        assert chunk.flash_cu_seqlens.dtype == torch.int64
+        assert chunk.flash_cu_seqlens.is_contiguous()
+        assert chunk.flash_cu_seqlens.tolist() == expected
+        assert chunk.flash_cu_seqlens_cpu.tolist() == expected
+    else:
+        assert chunk.flash_cu_seqlens is None
+        assert chunk.flash_cu_seqlens_cpu is None
+
+
+def test_flash_cu_has_batch_owned_storage_and_opt_in_builder():
+    assert AscendFlashKDAAttentionBackend.get_builder_cls() is AscendFlashKDAMetadataBuilder
+    assert AscendFlashKDAMetadataBuilder.build_flash_kda_cu_seqlens
+    assert not AscendGDNAttentionMetadataBuilder.build_flash_kda_cu_seqlens
+    assert not AscendGDNHostMetadataBuilder.build_flash_kda_cu_seqlens
+    chunks = [
+        ascend_gdn_attn_builder._build_non_spec_chunked_prefill_metadata(
+            SimpleNamespace(),
+            torch.tensor([0, end]),
+            torch.device("cpu"),
+            build_device_metadata=False,
+            build_flash_cu_seqlens=True,
+        )
+        for end in (128, 64)
+    ]
+    assert chunks[0].flash_cu_seqlens.data_ptr() != chunks[1].flash_cu_seqlens.data_ptr()
+    chunks[1].flash_cu_seqlens[-1] = 1
+    assert chunks[0].flash_cu_seqlens.tolist() == [0, 128]
+
+
+@pytest.mark.parametrize("kind", ["prefill", "mixed_decode", "mixed_spec", "decode"])
+def test_flash_cu_uses_only_prefill_tokens_in_mixed_batch(kind):
+    mixed = kind.startswith("mixed")
+    query_lens = [63, 65] if not mixed else ([4, 63, 65] if kind == "mixed_spec" else [1, 63, 65])
+    seq_lens = [63, 65] if not mixed else [10, 63, 65]
+    if kind == "decode":
+        seq_lens, query_lens = [10, 11], [1, 1]
+    builder = _make_builder(
+        device=torch.device("cpu"), num_heads=32, num_speculative_tokens=3, builder_cls=AscendFlashKDAMetadataBuilder
+    )
+    common = create_common_attn_metadata(BatchSpec(seq_lens, query_lens), 16, torch.device("cpu"))
+    with patch.object(
+        ascend_gdn_attn_builder,
+        "_build_non_spec_chunked_prefill_metadata",
+        wraps=ascend_gdn_attn_builder._build_non_spec_chunked_prefill_metadata,
+    ) as build_chunk:
+        metadata = builder.build(
+            0,
+            common,
+            num_accepted_tokens=torch.tensor([2, 1, 1]) if kind == "mixed_spec" else None,
+            num_decode_draft_tokens_cpu=torch.tensor([3, -1, -1]) if kind == "mixed_spec" else None,
+        )
+    assert build_chunk.call_count == int(kind != "decode")
+    if kind == "decode":
+        assert metadata.non_spec_prefill_metadata is None
+    else:
+        chunk = metadata.non_spec_prefill_metadata.chunk
+        assert chunk.cu_seqlens_host == (0, 63, 128)
+        assert chunk.flash_cu_seqlens.tolist() == [0, 63, 128]
+        assert build_chunk.call_args.kwargs["build_flash_cu_seqlens"] is True
 
 
 def test_sequence_index_buffers_cover_spec_decode_when_cudagraph_disabled():

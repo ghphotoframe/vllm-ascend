@@ -50,6 +50,7 @@ from vllm_ascend.utils import (
 
 from ..methods import get_scheme_class
 from ..utils import is_fused_moe_layer
+from .mixed_native_fp8 import configure_mixed_native_fp8, install_mixed_bailing_support
 
 _MOE_WEIGHT_LOADER_NAME_MAP = {
     "w13_scale_bias": "w13_scale",
@@ -442,6 +443,11 @@ class AscendModelSlimConfig(QuantizationConfig):
             hf_to_vllm_mapper: The WeightsMapper instance provided by vLLM
                 that contains model-specific prefix mappings (HF to vLLM).
         """
+        # Spawned workers inherit config state, not the parent's runtime
+        # adapters. Restore them before Bailing chooses its projection layout;
+        # get_quant_method() runs too late for the very first KDA projection.
+        if getattr(self, "_mixed_native_block_fp8", False):
+            install_mixed_bailing_support()
         if self._mapper_applied and self.hf_to_vllm_mapper is hf_to_vllm_mapper:
             return
 
@@ -681,6 +687,8 @@ class AscendModelSlimConfig(QuantizationConfig):
                 self.packed_modules_mapping["experts"] = [f"experts.0.{name}" for name in sorted(shard_names)]
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) -> Optional["QuantizeMethodBase"]:
+        if getattr(self, "_mixed_native_block_fp8", False):
+            install_mixed_bailing_support()
         from ..method_adapters import (
             AscendEmbeddingMethod,
             AscendFusedMoEMethod,
@@ -725,7 +733,13 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
                 return AscendUnquantizedLinearMethod()
-            scheme = create_scheme_for_layer(quant_type, prefix, "linear")
+            if quant_type == "fp8":
+                scheme_cls = get_scheme_class("fp8", "linear")
+                if scheme_cls is None:
+                    raise ValueError("Missing native block-FP8 linear scheme")
+                scheme = scheme_cls((128, 128))
+            else:
+                scheme = create_scheme_for_layer(quant_type, prefix, "linear")
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)
 
@@ -776,7 +790,13 @@ class AscendModelSlimConfig(QuantizationConfig):
             # Install the ModelSlim-specific loader now so every subsequently
             # registered MoE parameter receives the mapped loader.
             layer.weight_loader = _make_modelslim_moe_weight_loader(layer.weight_loader)
-            scheme = create_scheme_for_layer(quant_type, prefix, "moe")
+            if quant_type == "fp8":
+                scheme_cls = get_scheme_class("fp8", "moe")
+                if scheme_cls is None:
+                    raise ValueError("Missing native block-FP8 MoE scheme")
+                scheme = scheme_cls((128, 128), layer.moe_config)
+            else:
+                scheme = create_scheme_for_layer(quant_type, prefix, "moe")
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):
@@ -924,6 +944,7 @@ class AscendModelSlimConfig(QuantizationConfig):
         # If quant_description is already populated (e.g. from from_config()),
         # there is nothing to do.
         if self.quant_description:
+            configure_mixed_native_fp8(model_name, self)
             return
 
         # Try to get the config file (local or remote)
@@ -932,6 +953,9 @@ class AscendModelSlimConfig(QuantizationConfig):
         if config_path is not None:
             with open(config_path) as f:
                 self.quant_description = {**self._format_metadata, **json.load(f)}
+            native_count = configure_mixed_native_fp8(model_name, self)
+            if native_count:
+                logger.info("Mixed checkpoint: recognized %d native block-FP8 matrices", native_count)
             self._apply_extra_quant_adaptations()
             self._add_kvcache_quant_metadata()
             return

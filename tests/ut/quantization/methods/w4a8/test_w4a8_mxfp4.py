@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -344,6 +345,43 @@ class TestAscendW4A8MXFP4MoEMethod(TestBase):
         self.scheme.restore_weights_for_rl_loading(layer)
         self.assertEqual(tuple(layer.w13_weight.shape), original_shape)
         self.assertFalse(hasattr(layer, "_mxfp4_transformed"))
+
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.dispose_tensor")
+    @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.torch_npu")
+    def test_unfused_gmm1_preserves_mxfp4_operator_contract(self, mock_npu, _mock_dispose):
+        # Step activation uses the unfused GMM1 hook. Quantized weight scales
+        # must not be passed as output scales to the legacy WeightNz operator.
+        hidden = torch.randn(4, self.hidden_size, dtype=torch.bfloat16)
+        quantized = torch.empty(4, self.hidden_size, dtype=torch.float8_e4m3fn)
+        token_scales = torch.zeros(4, 2, 2, dtype=torch.uint8)
+        weights = [torch.zeros(2, 64, 128, dtype=torch.uint8)]
+        weight_scales = [torch.zeros(2, 2, 128, 2, dtype=torch.uint8)]
+        expected = torch.randn(4, 128, dtype=torch.bfloat16)
+        mock_npu.npu_grouped_matmul.return_value = [expected]
+        mlp_input = SimpleNamespace(
+            hidden_states=hidden,
+            dynamic_scale=None,
+            layer=nn.Module(),
+            group_list=torch.tensor([2, 2], dtype=torch.int64),
+            group_list_type=1,
+            activation=MoEActivation.SWIGLUSTEP,
+        )
+        with (
+            patch.object(self.scheme, "_quant_hidden_states", return_value=(quantized, token_scales)),
+            patch.object(self.scheme, "_get_mlp_weights", return_value=(weights, weight_scales, [], [])),
+        ):
+            output = self.scheme.apply_gmm1(mlp_input)
+        self.assertIs(output, expected)
+        args = mock_npu.npu_grouped_matmul.call_args.kwargs
+        self.assertIs(args["x"][0], quantized)
+        self.assertIs(args["weight"], weights)
+        self.assertIsNone(args["scale"])
+        self.assertIs(args["antiquant_scale"], weight_scales)
+        self.assertIs(args["per_token_scale"][0], token_scales)
+        self.assertIs(args["x_dtype"], torch.float8_e4m3fn)
+        self.assertIs(args["weight_dtype"], mock_npu.float4_e2m1fn_x2)
+        self.assertIs(args["per_token_scale_dtype"], mock_npu.float8_e8m0fnu)
+        self.assertNotIn("scale_dtype", args)
 
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.get_current_vllm_config")
     @patch("vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4.use_cann_megamoe", return_value=False)

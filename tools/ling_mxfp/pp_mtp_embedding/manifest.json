@@ -1,0 +1,7 @@
+{
+  "source_path": "/vllm-workspace/vllm/vllm/model_executor/models/bailing_moe_v3_mtp.py",
+  "before_sha256": "898c25789e62ce58ebdf62ddc57309498cdf3d482142669ea00000edc7cdb888",
+  "after_sha256": "2c2e7756cf7161f1522bc958d8386ebfa5f8c6c47484c71b0e77adef88404191",
+  "scope": "Ling MTP embedding placement and fail-closed checkpoint validation; no checkpoint changes or framework upgrades",
+  "user_authorized": true
+}

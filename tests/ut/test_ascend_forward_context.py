@@ -346,6 +346,74 @@ def test_select_moe_comm_method_a3_without_fused_mc2(
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
 
 
+@pytest.mark.parametrize("disable_decode", [False, True])
+@pytest.mark.parametrize("has_prefill", [None, False, True])
+@pytest.mark.parametrize("num_tokens", [1, 128, 4096, 4097, 8192])
+def test_a3_megamoe_phase_selection(monkeypatch, disable_decode, has_prefill, num_tokens):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A3, capacity=8192, enable_fused_mc2=1)
+    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_fused_mc2=1, disable_megamoe_for_decode=disable_decode),
+    )
+    config = _make_vllm_config(tensor_parallel_size=8)
+
+    # Includes one-token prefill: there is deliberately no token threshold.
+    expected = MoECommType.FUSED_MC2
+    if disable_decode and has_prefill is False:
+        expected = MoECommType.MC2 if num_tokens <= 4096 else MoECommType.ALLTOALL
+    assert afc.select_moe_comm_method(num_tokens, config, has_prefill=has_prefill) == expected
+
+
+@pytest.mark.parametrize("has_prefill", [None, False, True])
+@pytest.mark.parametrize("num_tokens", [128, 129])
+def test_decode_switch_does_not_enable_megamoe(monkeypatch, has_prefill, num_tokens):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A3, capacity=128)
+    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_fused_mc2=0, disable_megamoe_for_decode=True),
+    )
+    expected = MoECommType.MC2 if num_tokens <= 128 else MoECommType.ALLTOALL
+    assert afc.select_moe_comm_method(num_tokens, _make_vllm_config(), has_prefill=has_prefill) == expected
+
+
+def test_decode_switch_preserves_non_megamoe_fused_backend(monkeypatch):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A3, capacity=128, enable_fused_mc2=1)
+    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: False)
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_fused_mc2=1, disable_megamoe_for_decode=True),
+    )
+    assert afc.select_moe_comm_method(128, _make_vllm_config(), has_prefill=False) == MoECommType.FUSED_MC2
+
+
+@pytest.mark.parametrize("capacity, expected", [(None, 4096), (128, 128), (8192, 4096)])
+def test_staged_capacity_is_independent_of_megamoe_limit(monkeypatch, capacity, expected):
+    monkeypatch.setattr(afc, "get_mc2_tokens_capacity", lambda: capacity)
+    assert afc.get_staged_mc2_tokens_capacity(_make_vllm_config(tensor_parallel_size=8)) == expected
+
+
+def test_profile_phase_override_restores_nested_state_after_error():
+    assert afc.get_mrv2_in_profile_run() is False
+    assert afc.get_mrv2_profile_has_prefill() is None
+    with afc.override_mrv2_in_profile_run(True, has_prefill=False):
+        assert afc.get_mrv2_in_profile_run() is True
+        assert afc.get_mrv2_profile_has_prefill() is False
+        with (
+            pytest.raises(RuntimeError, match="profile failed"),
+            afc.override_mrv2_in_profile_run(True, has_prefill=True),
+        ):
+            assert afc.get_mrv2_profile_has_prefill() is True
+            raise RuntimeError("profile failed")
+        assert afc.get_mrv2_profile_has_prefill() is False
+    assert afc.get_mrv2_in_profile_run() is False
+    assert afc.get_mrv2_profile_has_prefill() is None
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "ep_world_size", "expected"),
     [
@@ -479,20 +547,28 @@ def test_select_moe_comm_method_a5_uses_megamoe_when_enabled(monkeypatch, num_to
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == MoECommType.FUSED_MC2
 
 
-@pytest.mark.parametrize("num_tokens", [128, 4096])
-@pytest.mark.parametrize("draft_quant", [QuantType.NONE, QuantType.W8A8MXFP, QuantType.W4A8MXFP, QuantType.W4A4MXFP])
-def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_tokens, draft_quant):
+@pytest.mark.parametrize("num_tokens", [128, 2048, 2049, 8192])
+@pytest.mark.parametrize("capacity", [128, 8192])
+@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize(
+    "draft_quant", [QuantType.NONE, QuantType.W8A8FP, QuantType.W8A8MXFP, QuantType.W4A8MXFP, QuantType.W4A4MXFP]
+)
+def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_tokens, capacity, top_k, draft_quant):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=AscendDeviceType.A5,
-        capacity=128,
+        capacity=capacity,
+        ep_world_size=4,
         enable_fused_mc2=1,
     )
     monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
-    vllm_config = _make_vllm_config(world_size=8, top_k_experts=4)
+    vllm_config = _make_vllm_config(world_size=8, pipeline_parallel_size=2, tensor_parallel_size=4, top_k_experts=top_k)
     expected = MoECommType.FUSED_MC2
-    if draft_quant == QuantType.NONE:
-        expected = MoECommType.MC2 if num_tokens <= 128 else MoECommType.ALLTOALL
+    if draft_quant in (QuantType.NONE, QuantType.W8A8FP):
+        # Unsupported drafts use ordinary MC2, whose token capacity remains
+        # 512/rank even when the target reserves a larger MegaMoE buffer.
+        fallback = MoECommType.ALLGATHER if top_k == 8 else MoECommType.ALLTOALL
+        expected = MoECommType.MC2 if num_tokens <= min(capacity, 512 * 4) else fallback
     assert (
         afc.select_moe_comm_method(num_tokens, vllm_config, is_draft_model=True, draft_moe_quant_type=draft_quant)
         == expected

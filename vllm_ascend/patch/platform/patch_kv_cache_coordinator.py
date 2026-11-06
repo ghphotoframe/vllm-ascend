@@ -7,6 +7,7 @@ from math import lcm
 import vllm
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
@@ -19,6 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
     KVCacheBlock,
+    dcp_world_size_for_kv_cache_spec,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
@@ -33,6 +35,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+
+logger = init_logger(__name__)
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -89,6 +93,14 @@ def _manager_spec(spec: KVCacheSpec) -> KVCacheSpec:
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return next(iter(spec.kv_cache_specs.values()))
     return spec
+
+
+def _manager_dcp_world_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
+    # Mamba states are replicated, unlike attention KV. Reuse upstream's
+    # per-spec geometry for Mamba without changing Ascend's other cache types.
+    if isinstance(_manager_spec(spec), MambaSpec):
+        return dcp_world_size_for_kv_cache_spec(spec, dcp_world_size)
+    return dcp_world_size
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -178,7 +190,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                dcp_world_size=_manager_dcp_world_size(kv_cache_group.kv_cache_spec, dcp_world_size),
                 pcp_world_size=1,
                 max_in_flight_tokens=token_budget,
                 max_model_len=max_model_len,
@@ -206,12 +218,40 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
                 if is_prefix_cacheable(g.kv_cache_spec)
             ), "block_size must be divisible by hash_block_size"
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
+        cacheable_specs = [
+            _manager_spec(g.kv_cache_spec)
             for g in kv_cache_config.kv_cache_groups
+            if is_prefix_cacheable(g.kv_cache_spec)
+        ]
+        # Upstream supports partial DCP hits for full attention + replicated
+        # Mamba. Keep other Ascend DCP layouts on their existing whole-block
+        # lookup path. DCP enlarges attention blocks, so Mamba == hash is enough.
+        supports_partial_dcp = all(isinstance(spec, (FullAttentionSpec, MambaSpec)) for spec in cacheable_specs)
+        has_partial_mamba_group = any(
+            isinstance(spec, MambaSpec)
+            and spec.mamba_cache_mode == "align"
+            and (
+                (dcp_world_size == 1 and spec.block_size > hash_block_size)
+                or (dcp_world_size > 1 and supports_partial_dcp and spec.block_size >= hash_block_size)
+            )
+            for spec in cacheable_specs
         )
+        self.enable_partial_hash_hits = allow_partial_hash_hits and has_partial_mamba_group
+        if self.enable_partial_hash_hits:
+            unsupported_managers = {
+                type(manager).__name__
+                for manager, group in zip(self.single_type_managers, kv_cache_config.kv_cache_groups)
+                if is_prefix_cacheable(group.kv_cache_spec)
+                and not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != hash_block_size
+            }
+            if unsupported_managers:
+                self.enable_partial_hash_hits = False
+                logger.warning_once(
+                    "Disabling fine-grained prefix-cache hits because these KV "
+                    "cache managers require block-aligned lookups: %s.",
+                    ", ".join(sorted(unsupported_managers)),
+                )
         self.verify_and_split_kv_cache_groups()
 
         # Align the WRITE-path mask granularity (reachable_block_mask) with the
@@ -251,6 +291,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         return lcm(self.scheduler_block_size or self.lcm_block_size, tail_alignment)
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
+        kv_cache_spec = _manager_spec(kv_cache_spec)
         block_size = kv_cache_spec.block_size
         if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:
             return block_size
@@ -421,7 +462,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=self.dcp_world_size,
+                    dcp_world_size=_manager_dcp_world_size(spec, self.dcp_world_size),
                     pcp_world_size=1,
                 )
                 hit_blocks, _new_hit_length = hit_result
@@ -483,7 +524,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle and not self.skips_eagle_block_drop,
                 alignment_tokens=self._cache_hit_alignment_tokens,
-                dcp_world_size=self.dcp_world_size,
+                dcp_world_size=_manager_dcp_world_size(spec, self.dcp_world_size),
                 pcp_world_size=1,
             )
             for gid, blks in zip(group_ids, blocks):

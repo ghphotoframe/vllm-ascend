@@ -90,6 +90,7 @@ class TestMoECommMethod(TestBase):
         comm_impl.get_symm_buffer_for_mega_moe.assert_called_once()
         call_args = comm_impl.get_symm_buffer_for_mega_moe.call_args
         self.assertEqual(call_args.args[:4], ("mc2_group", 8, 128, 2))
+        self.assertEqual(call_args.kwargs["intermediate_hidden"], 32)
         self.assertEqual(call_args.kwargs["max_recv_token_num"], 512)
         mock_warning_once.assert_called_once()
         self.assertIn("mega_moe_max_tokens", mock_warning_once.call_args.args[0])
@@ -127,6 +128,22 @@ class TestMoECommMethod(TestBase):
         call_args = comm_impl.get_symm_buffer_for_mega_moe.call_args
         self.assertEqual(call_args.kwargs["max_recv_token_num"], 1024)
         mock_warning_once.assert_not_called()
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")
+    def test_mega_moe_symm_buffer_uses_post_activation_intermediate(self, mock_get_mc2_group):
+        mock_get_mc2_group.return_value.device_group = "mc2_group"
+        comm_impl = self._make_fused_mc2_comm_for_buffer_init()
+        # Ling's packed FP4 projection is [2I, H/2], but the CANN
+        # symmetric-buffer API expects I, independently of that storage.
+        comm_impl.moe_config.intermediate_size_per_partition = 1280
+        comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=True)
+        self.assertEqual(comm_impl.get_symm_buffer_for_mega_moe.call_args.kwargs["intermediate_hidden"], 1280)
+
+        # A BF16 path may override the logical config with its padded I.
+        comm_impl.get_symm_buffer_for_mega_moe.reset_mock()
+        comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=True, intermediate_hidden=1536)
+        self.assertEqual(comm_impl.get_symm_buffer_for_mega_moe.call_args.kwargs["intermediate_hidden"], 1536)
+        self.assertEqual(comm_impl.moe_config.intermediate_size_per_partition, 1280)
 
     def test_apply_cann_mega_moe_passes_oai_kwargs_when_supported(self):
         captured = {}

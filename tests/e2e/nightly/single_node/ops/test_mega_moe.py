@@ -1,11 +1,14 @@
 """A5 MegaMoe weight/activation integration and latency comparison.
 
-Requires eight idle A5 NPUs and a CANN package with SiTU MegaMoe support.
+Requires idle A5 NPUs and a CANN package supporting the selected activation.
 Source the CANN environment and set the HCCL/GLOO interface before running:
 
     torchrun --nproc_per_node=8 test_mega_moe.py --tokens 4 32 256 512
     torchrun --nproc_per_node=8 test_mega_moe.py --tokens 256 --graph
     torchrun --nproc_per_node=8 test_mega_moe.py --tokens 2048 --input-scale 10
+    torchrun --nproc_per_node=4 test_mega_moe.py --hidden 4096 --intermediate 1280 \
+        --experts 512 --topk 8 --activation swiglustep --activation-clamp 10 \
+        --tokens 4 32 256 --input-scale 10
 
 Use a fresh process for each graph shape to isolate CANN/HCCL graph lifetime.
 Defaults retain 28 local experts and the routed FFN dimensions of an EP32
@@ -44,12 +47,17 @@ def main():
     p.add_argument("--topk", type=int, default=16)
     p.add_argument("--tokens", type=int, nargs="+", default=[4, 32, 256, 512])
     p.add_argument("--repeats", type=int, default=20)
-    p.add_argument("--activation", choices=["situ", "silu"], default="situ")
+    p.add_argument("--activation", choices=["situ", "silu", "swiglustep"], default="situ")
+    p.add_argument("--activation-clamp", type=float, default=10.0)
     p.add_argument("--graph", action="store_true")
     p.add_argument("--input-scale", type=float, default=1.0)
     a = p.parse_args()
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
+    if world < 2 or a.experts % world or not (1 <= a.topk <= min(32, a.experts)):
+        p.error("require EP >= 2, experts divisible by EP, and topk in [1, min(32, experts)]")
+    if min(a.tokens) < 1 or a.repeats < 1 or a.activation_clamp <= 0:
+        p.error("tokens, repeats and activation-clamp must be positive")
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl")
     group = dist.new_group(backend="hccl")
@@ -66,7 +74,7 @@ def main():
     act_kwargs = select_mega_moe_activation_kwargs(
         mega,
         activation=a.activation,
-        activation_clamp=None,
+        activation_clamp=a.activation_clamp if a.activation == "swiglustep" else None,
         swiglu_alpha=1.0,
         swiglu_beta=0.0,
         situ_beta=4.0,
@@ -94,6 +102,9 @@ def main():
         for name, value in layer.named_parameters():
             baseline.register_parameter(name, torch.nn.Parameter(value.clone(), requires_grad=False))
         method = object.__new__(w4a8_mxfp4.AscendW4A8MXFPDynamicFusedMoEMethod)
+        method.group_size = 32
+        method.dynamic_eplb = False
+        method.use_expert_weight_list = False
         with patch.object(w4a8_mxfp4, "get_current_vllm_config", return_value=None):
             with patch.object(w4a8_mxfp4, "use_cann_megamoe", return_value=False):
                 method.process_weights_after_loading(baseline)
@@ -187,6 +198,13 @@ def main():
             activated, act_scale = torch.ops._C_ascend.situ_mx_quant(
                 x=mm1, beta=4.0, linear_beta=25.0, activate_left=True, dst_type=36
             )
+        elif a.activation == "swiglustep":
+            # Independent Step reference: clamp SiLU(gate), then multiply by
+            # clamped up. Clamping gate before SiLU changes the checkpoint.
+            gate, up = mm1.float().chunk(2, dim=-1)
+            step = torch.nn.functional.silu(gate).clamp(max=a.activation_clamp)
+            step = step * up.clamp(min=-a.activation_clamp, max=a.activation_clamp)
+            activated, act_scale = torch_npu.npu_dynamic_mx_quant(step.to(mm1.dtype), dst_type=torch.float8_e4m3fn)
         else:
             activated, act_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
                 mm1, topk_weight=None, group_index=counts, dst_type=torch.float8_e4m3fn, quant_mode=2, clamp_value=0.0

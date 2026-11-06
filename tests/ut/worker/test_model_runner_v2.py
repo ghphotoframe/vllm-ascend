@@ -33,6 +33,7 @@ from vllm_ascend.worker.v2.utils import C8KVBlockZeroer
 def _make_runner(need_timing: bool = True):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.ascend_config = SimpleNamespace(
+        disable_megamoe_for_decode=False,
         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
         sparse_kv_offload_config=SimpleNamespace(enabled=False),
     )
@@ -946,6 +947,7 @@ def test_kvpp_history_ignores_padding_and_dummy_work(monkeypatch, computed, dumm
         query_start_loc=torch.tensor([0, 1, 2, 2, 2]),
         num_scheduled_tokens=torch.tensor([1, 1]),
         is_prefilling_np=np.array([True, False, False, False]),
+        has_prefill=True,
         seq_lens=torch.tensor([1, 5]),
         seq_lens_np=np.array([1, 5]),
         dcp_local_seq_lens=None,

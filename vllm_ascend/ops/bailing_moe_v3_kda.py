@@ -13,9 +13,11 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
-from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
-from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
+from vllm_ascend.ops.gdn_attn_builder import AscendFlashKDAAttentionBackend, AscendGDNAttentionBackend
+from vllm_ascend.ops.kda import run_recurrent_kda
+from vllm_ascend.ops.kda_backend import FLASH_KDA_ENABLED, run_chunk_kda
 from vllm_ascend.ops.kda_conv import native_conv_state_supported, pack_kda_conv_weights, run_causal_conv1d
+from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state, gather_update_conv_state
 
 _KDA_MAX_RECURRENT_TOKENS = 8
@@ -63,7 +65,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         self._ascend_conv_weights_initialized = False
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return AscendGDNAttentionBackend
+        return AscendFlashKDAAttentionBackend if FLASH_KDA_ENABLED else AscendGDNAttentionBackend
 
     def forward(
         self,
@@ -91,7 +93,9 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 dim=-1,
             )
 
-        beta = beta_logits.float().sigmoid().unsqueeze(0)
+        # FlashKDA fuses sigmoid and must receive the original BF16 logits.
+        # Never reconstruct them with logit(sigmoid(beta)), which loses tails.
+        beta = (beta_logits if FLASH_KDA_ENABLED else beta_logits.float().sigmoid()).unsqueeze(0)
         # AscendC performs the A_log/dt_bias gate conversion in-kernel. Passing
         # vLLM's CUDA-preprocessed gate here would apply that conversion twice.
         raw_gate = rearrange(self.f_proj(hidden_states)[0], "n (h d) -> 1 n h d", d=self.head_dim)
@@ -276,6 +280,16 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         *,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if FLASH_KDA_ENABLED:
+            # Keep the established AscendC recurrent/decode arithmetic even
+            # when prefill uses raw logits for FlashKDA (including mixed/MTP).
+            beta = beta.float().sigmoid()
+        if num_accepted_tokens is not None:
+            # Accepted count describes the previous verification, whose length
+            # may exceed this query after a shortened speculative proposal.
+            num_accepted_tokens = rebase_short_kda_queries(
+                recurrent_state, state_indices, cu_seqlens, num_accepted_tokens
+            )
         return run_recurrent_kda(
             q,
             k,
@@ -322,6 +336,11 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
             raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
         initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state)
+        prefill_kwargs = {"lower_bound": self.lower_bound if self.safe_gate else None}
+        if FLASH_KDA_ENABLED:
+            if prebuilt_metadata.flash_cu_seqlens is None:
+                raise RuntimeError("FlashKDA prefill requires batch device cu_seqlens metadata")
+            prefill_kwargs["cu_seqlens_device"] = prebuilt_metadata.flash_cu_seqlens
         output, final_state = run_chunk_kda(
             q,
             k,
@@ -333,7 +352,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             prebuilt_metadata.chunk_indices_chunk64_host,
             self.A_log,
             self.dt_bias,
-            lower_bound=self.lower_bound if self.safe_gate else None,
+            **prefill_kwargs,
         )
         state_copy.scatter(recurrent_state, final_state, state_indices)
         return output

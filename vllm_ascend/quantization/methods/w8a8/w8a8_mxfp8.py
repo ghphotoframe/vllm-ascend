@@ -700,6 +700,16 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         return [getattr(layer, name)]
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
+        # The fused GMM+SwiGLU kernel has no activation-limit argument.
+        # Preserve the model's clipped SwiGLU contract using the existing
+        # MXFP8 GMM -> activation -> MXFP8 quantization path when required.
+        if mlp_compute_input.swiglu_limit > 0:
+            from vllm_ascend.ops.fused_moe.moe_mlp import _unified_apply_activation
+
+            hidden_states = self.apply_gmm1(mlp_compute_input)
+            hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, self)
+            return self.apply_act_quant(mlp_compute_input, hidden_states)
+
         hidden_states = mlp_compute_input.hidden_states
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer

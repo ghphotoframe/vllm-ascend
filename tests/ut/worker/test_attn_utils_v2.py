@@ -1650,6 +1650,7 @@ def test_v2_fused_offload_prepares_request_ownership_and_restores_tails(monkeypa
         req_ids=["request-1"],
         num_computed_tokens_np=np.array([128], dtype=np.int32),
         is_prefilling_np=np.array([False]),
+        has_prefill=False,
         num_scheduled_tokens=torch.tensor([1], dtype=torch.int32),
         seq_lens=torch.tensor([129], dtype=torch.int32),
         seq_lens_np=np.array([129], dtype=np.int32),
@@ -1942,6 +1943,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens_np=np.array([2, 3, 0, 0], dtype=np.int32),
             is_prefilling_np=np.array([True, True, False, False]),
+            has_prefill=True,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=torch.arange(8, dtype=torch.int32),
             attn_state=None,
@@ -1956,6 +1958,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             for_capture=for_capture,
         )
 
+    assert metadata.has_prefill is (None if caller == "default" else True)
     assert set(metadata) == set(layer_names)
     assert len(calls) == 2
     for call in calls:

@@ -1,0 +1,55 @@
+--- a/vllm/model_executor/models/bailing_moe_v3_mtp.py
++++ b/vllm/model_executor/models/bailing_moe_v3_mtp.py
+@@ -39,7 +39,6 @@
+     SupportsPP,
+ )
+ from vllm.model_executor.models.utils import (
+-    PPMissingLayer,
+     _merge_multimodal_embeddings,
+     is_pp_missing_parameter,
+     maybe_prefix,
+@@ -174,15 +173,14 @@
+                 )
+             }
+         )
+-        if get_pp_group().is_first_rank:
+-            self.embed_tokens = VocabParallelEmbedding(
+-                config.vocab_size,
+-                config.hidden_size,
+-                org_num_embeddings=config.vocab_size,
+-                prefix=maybe_prefix(prefix, "embed_tokens"),
+-            )
+-        else:
+-            self.embed_tokens = PPMissingLayer()
++        # The complete drafter runs on the last target PP stage. Its input
++        # embedding must live with it rather than inherit target PP placement.
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size,
++            config.hidden_size,
++            org_num_embeddings=config.vocab_size,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
++        )
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+@@ -229,6 +227,9 @@
+     }
+ )
+ class BailingMoeV3MTPModel(nn.Module, SupportsPP, SupportsMultiModalEmbeddings):
++    # PP's last target stage has no target input embedding to share.
++    has_own_embed_tokens = True
++
+     hf_to_vllm_mapper = BailingMoeV3ForCausalLM.hf_to_vllm_mapper
+ 
+     packed_modules_mapping = {
+@@ -440,4 +441,10 @@
+                     "weights are missing from checkpoint. Use a checkpoint that "
+                     "includes MTP layer weights, or disable speculative decoding."
+                 )
++        self.has_own_embed_tokens = "model.embed_tokens.weight" in loaded_params
++        if get_pp_group().world_size > 1 and not self.has_own_embed_tokens:
++            raise ValueError(
++                "Bailing V3 MTP on the last PP stage requires input embedding "
++                "weights from the checkpoint; target embeddings are unavailable."
++            )
+         return loaded_params
