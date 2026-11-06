@@ -77,11 +77,15 @@ class _FakeBlockPool:
 
 
 class _FakeFAManager:
+    supports_fine_grained_hash_lookup = True
+
     def __init__(self, **kwargs):
         self.use_eagle = False
 
 
 class _FakeMambaManager:
+    supports_fine_grained_hash_lookup = True
+
     def __init__(self, **kwargs):
         self.use_eagle = False
 
