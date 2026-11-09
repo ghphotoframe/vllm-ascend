@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Adapter for the optional A5 PyPTO FlashKDA V1 distribution.
+"""Adapter for the bundled A5 PyPTO FlashKDA V1 implementation.
 
-Place the vendor's ``flash_kda/`` directory on PYTHONPATH. Do not import PyPTO
-until an opted-in worker actually executes prefill. This adapter implements
-the source-verified V1 ABI; it does not vendor or install the external operator.
+The operator lives in ``vllm_ascend.ops.pypto.flash_kda``. Import it only when
+an opted-in worker executes prefill, keeping the PyPTO runtime optional for
+other serving paths. The runtime itself is installed separately.
 """
 
 from collections.abc import Sequence
@@ -101,12 +101,14 @@ def run_flash_chunk_kda(
         raise ValueError("FlashKDA prepared cu_seqlens must be contiguous INT64 [N+1] on the input NPU.")
     # Lazy loading isolates this optional dependency from default/A2/A3 use.
     try:
-        from flash_kda.flash_kda import flash_kda_wrapper
+        from vllm_ascend.ops.pypto.flash_kda import flash_kda_wrapper
     except ModuleNotFoundError as exc:
+        if (exc.name or "").partition(".")[0] not in {"pypto", "pypto_pro"}:
+            raise
         raise RuntimeError(
-            "FlashKDA was enabled but its optional dependency is missing. Install the compatible "
-            "PyPTO distribution and put the vendor flash_kda/ directory on PYTHONPATH "
-            "(from flash_kda.flash_kda import flash_kda_wrapper), or set VLLM_ASCEND_ENABLE_FLASH_KDA=0."
+            "FlashKDA was enabled but its PyPTO runtime dependency is missing. "
+            "Install the compatible PyPTO wheel in the worker environment, "
+            "or set VLLM_ASCEND_ENABLE_FLASH_KDA=0."
         ) from exc
 
     del chunk_indices  # FlashKDA builds its own chunk descriptors.

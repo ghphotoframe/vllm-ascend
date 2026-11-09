@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for backend selection and the optional FlashKDA boundary."""
 
+import builtins
 import importlib.util
 import sys
 from pathlib import Path
@@ -14,6 +15,21 @@ import torch
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.ops import flash_kda, kda
+
+_INTERNAL_FLASH_KDA_MODULE = "vllm_ascend.ops.pypto.flash_kda"
+
+
+def _block_optional_imports(name, globals=None, locals=None, fromlist=(), level=0):
+    if (
+        name == "flash_kda"
+        or name.startswith(("flash_kda.", "vllm_ascend.ops.pypto"))
+        or name.split(".", 1)[0] in ("pypto", "pypto_pro")
+    ):
+        raise AssertionError(f"optional operator imported eagerly: {name}")
+    return _ORIGINAL_IMPORT(name, globals, locals, fromlist, level)
+
+
+_ORIGINAL_IMPORT = builtins.__import__
 
 
 class _NPUTensor(torch.Tensor):
@@ -74,7 +90,7 @@ def test_import_selection_is_a5_only_and_does_not_import_vendor(monkeypatch, dev
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASH_KDA", str(int(enabled)))
     with (
         patch("vllm_ascend.device.get_current_hardware_profile", return_value=get_hardware_profile(device_type)),
-        patch.dict(sys.modules, {"flash_kda": None, "flash_kda.flash_kda": None}),
+        patch("builtins.__import__", side_effect=_block_optional_imports),
     ):
         if enabled and device_type != AscendDeviceType.A5:
             with pytest.raises(RuntimeError, match="requires A5"):
@@ -95,7 +111,7 @@ def test_import_selection_is_a5_only_and_does_not_import_vendor(monkeypatch, dev
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 def test_adapter_preserves_raw_inputs_and_vk_state(a5_profile, lengths, key_heads, value_heads, cache_dtype):
     inputs = _inputs(lengths=lengths, key_heads=key_heads, value_heads=value_heads, cache_dtype=cache_dtype)
-    vendor = ModuleType("flash_kda.flash_kda")
+    vendor = ModuleType(_INTERNAL_FLASH_KDA_MODULE)
     expected_output, expected_state = object(), object()
     vendor.flash_kda_wrapper = MagicMock(return_value=(expected_output, expected_state))
     tensor_constructor = torch.tensor
@@ -105,7 +121,7 @@ def test_adapter_preserves_raw_inputs_and_vk_state(a5_profile, lengths, key_head
         return tensor_constructor(data, dtype=dtype).as_subclass(_NPUTensor)
 
     with (
-        patch.dict(sys.modules, {"flash_kda.flash_kda": vendor}),
+        patch.dict(sys.modules, {_INTERNAL_FLASH_KDA_MODULE: vendor}),
         patch.object(flash_kda.torch, "tensor", side_effect=make_cu),
     ):
         assert flash_kda.run_flash_chunk_kda(**inputs) == (expected_output, expected_state)
@@ -135,7 +151,10 @@ def test_adapter_preserves_raw_inputs_and_vk_state(a5_profile, lengths, key_head
 def test_adapter_rejects_unsupported_gate_without_importing_vendor(a5_profile, lower_bound):
     inputs = _inputs(lengths=(5,))
     inputs["lower_bound"] = lower_bound
-    with patch.dict(sys.modules, {"flash_kda.flash_kda": None}), pytest.raises(ValueError, match="safe_gate"):
+    with (
+        patch("builtins.__import__", side_effect=_block_optional_imports),
+        pytest.raises(ValueError, match="safe_gate"),
+    ):
         flash_kda.run_flash_chunk_kda(**inputs)
 
 
@@ -189,17 +208,45 @@ def test_direct_adapter_call_cannot_bypass_hardware_guard(device_type):
         flash_kda.run_flash_chunk_kda(**_inputs(lengths=(5,)))
 
 
-def test_missing_vendor_has_actionable_error(a5_profile):
+@pytest.mark.parametrize("missing", ["pypto", "pypto_pro", "pypto_pro.language"])
+def test_missing_pypto_has_actionable_error(a5_profile, missing):
+    inputs = _inputs(lengths=(5,))
+    failure = ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+
+    def import_without_pypto(name, *args, **kwargs):
+        if name == _INTERNAL_FLASH_KDA_MODULE:
+            raise failure
+        return _ORIGINAL_IMPORT(name, *args, **kwargs)
+
     with (
-        patch.dict(sys.modules, {"flash_kda": None, "flash_kda.flash_kda": None}),
-        pytest.raises(RuntimeError, match="optional dependency is missing") as error,
+        patch("builtins.__import__", side_effect=import_without_pypto),
+        pytest.raises(RuntimeError, match="PyPTO") as error,
     ):
-        flash_kda.run_flash_chunk_kda(**_inputs(lengths=(5,)))
-    assert isinstance(error.value.__cause__, ModuleNotFoundError)
+        flash_kda.run_flash_chunk_kda(**inputs)
+    assert error.value.__cause__ is failure
+    assert "vendor flash_kda/" not in str(error.value)
+
+
+@pytest.mark.parametrize("missing", [_INTERNAL_FLASH_KDA_MODULE, "torch_npu", "unrelated_dependency"])
+def test_missing_non_pypto_dependency_is_not_mislabeled_or_fallback(a5_profile, missing):
+    inputs = _inputs(lengths=(5,))
+    failure = ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+
+    def import_with_unrelated_failure(name, *args, **kwargs):
+        if name == _INTERNAL_FLASH_KDA_MODULE:
+            raise failure
+        return _ORIGINAL_IMPORT(name, *args, **kwargs)
+
+    with (
+        patch("builtins.__import__", side_effect=import_with_unrelated_failure),
+        pytest.raises(ModuleNotFoundError) as error,
+    ):
+        flash_kda.run_flash_chunk_kda(**inputs)
+    assert error.value is failure
 
 
 def test_vendor_runtime_failure_is_not_silently_fallback(a5_profile):
-    vendor = ModuleType("flash_kda.flash_kda")
+    vendor = ModuleType(_INTERNAL_FLASH_KDA_MODULE)
     failure = RuntimeError("vendor kernel failed")
     vendor.flash_kda_wrapper = MagicMock(side_effect=failure)
     tensor_constructor = torch.tensor
@@ -208,7 +255,7 @@ def test_vendor_runtime_failure_is_not_silently_fallback(a5_profile):
         return tensor_constructor(data, dtype=dtype)
 
     with (
-        patch.dict(sys.modules, {"flash_kda.flash_kda": vendor}),
+        patch.dict(sys.modules, {_INTERNAL_FLASH_KDA_MODULE: vendor}),
         patch.object(flash_kda.torch, "tensor", side_effect=make_cu),
         pytest.raises(RuntimeError, match="vendor kernel failed") as error,
     ):
@@ -220,10 +267,10 @@ def test_prepared_cu_is_reused_without_allocation_or_device_read(a5_profile):
     inputs = _inputs(lengths=(63, 65))
     prepared = torch.tensor(inputs["cu_seqlens"], dtype=torch.int64).as_subclass(_NPUTensor)
     inputs["cu_seqlens_device"] = prepared
-    vendor = ModuleType("flash_kda.flash_kda")
+    vendor = ModuleType(_INTERNAL_FLASH_KDA_MODULE)
     vendor.flash_kda_wrapper = MagicMock(return_value=(object(), object()))
     with (
-        patch.dict(sys.modules, {"flash_kda.flash_kda": vendor}),
+        patch.dict(sys.modules, {_INTERNAL_FLASH_KDA_MODULE: vendor}),
         patch.object(flash_kda.torch, "tensor", side_effect=AssertionError("per-layer cu allocation")),
         patch.object(_NPUTensor, "cpu", side_effect=AssertionError("device read")),
         patch.object(_NPUTensor, "tolist", side_effect=AssertionError("device read")),
@@ -233,6 +280,27 @@ def test_prepared_cu_is_reused_without_allocation_or_device_read(a5_profile):
             flash_kda.run_flash_chunk_kda(**inputs)
             assert vendor.flash_kda_wrapper.call_args.kwargs["cu_seqlens"] is prepared
     assert vendor.flash_kda_wrapper.call_count == 3
+
+
+def test_adapter_uses_internal_operator_without_external_flash_kda_package(a5_profile):
+    inputs = _inputs(lengths=(5,))
+    inputs["cu_seqlens_device"] = torch.tensor([0, 5], dtype=torch.int64).as_subclass(_NPUTensor)
+    bundled = ModuleType(_INTERNAL_FLASH_KDA_MODULE)
+    expected = (object(), object())
+    bundled.flash_kda_wrapper = MagicMock(return_value=expected)
+
+    def reject_external_operator(name, *args, **kwargs):
+        if name == "flash_kda" or name.startswith("flash_kda."):
+            raise AssertionError(f"external operator package required: {name}")
+        return _ORIGINAL_IMPORT(name, *args, **kwargs)
+
+    with (
+        patch.dict(sys.modules, {_INTERNAL_FLASH_KDA_MODULE: bundled}),
+        patch("builtins.__import__", side_effect=reject_external_operator),
+        patch.object(flash_kda.torch, "tensor", side_effect=AssertionError("per-layer cu allocation")),
+    ):
+        assert flash_kda.run_flash_chunk_kda(**inputs) == expected
+    bundled.flash_kda_wrapper.assert_called_once()
 
 
 @pytest.mark.parametrize(
