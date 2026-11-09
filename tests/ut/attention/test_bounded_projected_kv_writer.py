@@ -34,7 +34,6 @@ def load_methods(source):
         "torch_npu": SimpleNamespace(npu_kv_rmsnorm_rope_cache=object()),
         "cdiv": lambda a, b: (a + b - 1) // b,
         "DeviceOperator": SimpleNamespace(),
-        "logger": SimpleNamespace(info=lambda *a, **kw: None),
     }
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
     return namespace["AscendMLAImpl"], namespace
@@ -175,13 +174,3 @@ class TestProjectedKVWriter(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unquantized caches"):
             slots = torch.zeros(2, dtype=torch.int64)
             self.impl._exec_strided_kv_writer(torch.zeros(2, 6), None, None, quantized, slots)
-
-
-if __name__ == "__main__":
-    import sys
-
-    if "--source" in sys.argv:
-        index = sys.argv.index("--source")
-        SOURCE = Path(sys.argv[index + 1])
-        del sys.argv[index : index + 2]
-    unittest.main()

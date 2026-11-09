@@ -325,6 +325,8 @@ def create_scheme_for_layer(
     quant_type: str,
     prefix: str,
     layer_type: str,
+    *,
+    moe_config=None,
 ):
     """Create a quantization scheme instance for a layer.
 
@@ -332,6 +334,7 @@ def create_scheme_for_layer(
         quant_type: The quantization type string (e.g., "W8A8_DYNAMIC").
         prefix: The layer prefix.
         layer_type: The type of layer ("linear", "moe", "attention").
+        moe_config: The existing MoE configuration for a native block-FP8 scheme.
 
     Returns:
         An instance of the appropriate quantization scheme class.
@@ -345,6 +348,9 @@ def create_scheme_for_layer(
     # Use registry to get scheme class
     scheme_cls = get_scheme_class(quant_type, layer_type)
     if scheme_cls is not None:
+        if quant_type == "fp8" and layer_type in ("linear", "moe"):
+            block_size = (128, 128)
+            return scheme_cls(block_size, moe_config) if layer_type == "moe" else scheme_cls(block_size)
         return scheme_cls()
 
     err_msg = (
@@ -687,8 +693,6 @@ class AscendModelSlimConfig(QuantizationConfig):
                 self.packed_modules_mapping["experts"] = [f"experts.0.{name}" for name in sorted(shard_names)]
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) -> Optional["QuantizeMethodBase"]:
-        if getattr(self, "_mixed_native_block_fp8", False):
-            install_mixed_bailing_support()
         from ..method_adapters import (
             AscendEmbeddingMethod,
             AscendFusedMoEMethod,
@@ -733,13 +737,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
                 return AscendUnquantizedLinearMethod()
-            if quant_type == "fp8":
-                scheme_cls = get_scheme_class("fp8", "linear")
-                if scheme_cls is None:
-                    raise ValueError("Missing native block-FP8 linear scheme")
-                scheme = scheme_cls((128, 128))
-            else:
-                scheme = create_scheme_for_layer(quant_type, prefix, "linear")
+            scheme = create_scheme_for_layer(quant_type, prefix, "linear")
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)
 
@@ -790,13 +788,7 @@ class AscendModelSlimConfig(QuantizationConfig):
             # Install the ModelSlim-specific loader now so every subsequently
             # registered MoE parameter receives the mapped loader.
             layer.weight_loader = _make_modelslim_moe_weight_loader(layer.weight_loader)
-            if quant_type == "fp8":
-                scheme_cls = get_scheme_class("fp8", "moe")
-                if scheme_cls is None:
-                    raise ValueError("Missing native block-FP8 MoE scheme")
-                scheme = scheme_cls((128, 128), layer.moe_config)
-            else:
-                scheme = create_scheme_for_layer(quant_type, prefix, "moe")
+            scheme = create_scheme_for_layer(quant_type, prefix, "moe", moe_config=layer.moe_config)
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):

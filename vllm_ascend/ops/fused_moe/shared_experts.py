@@ -590,19 +590,15 @@ class AscendSharedExperts:
         owned padding, scale algorithm, and output dtype remain intact.
         Gate-Up has already been submitted before routed TopK/dispatch.
         """
+        # Unaligned MXFP shared experts use the existing activation and
+        # scheme-owned preparation path, including both routed-stage waits.
+        if submitted_gate_up.gate_up.shape[-1] % SWIGLU_MX_INPUT_ALIGNMENT != 0:
+            return self._finish_linear_wrapped_mlp(submitted_gate_up, milestones)
         self._wait_for_routed_stage(
             milestones,
             milestones.shared_activation_overlap_start,
             "shared_activation_overlap_start",
         )
-        # The fused MX SwiGLU kernel requires pairs of MX32 scale groups.
-        # Keep unaligned TP shared experts on the existing activation and
-        # scheme-owned preparation path, preserving clipping and MXFP8.
-        if submitted_gate_up.gate_up.shape[-1] % SWIGLU_MX_INPUT_ALIGNMENT != 0:
-            shared_act = self.apply_activation(submitted_gate_up.gate_up)
-            down_input = self._prepare_linear_input_for_overlap(self.layer.down_proj, shared_act)
-            self._wait_for_routed_stage(milestones, milestones.routed_combine_start, "routed_combine_start")
-            return self.part2(submitted_gate_up.hidden_states, down_input)
 
         if self.situ_activation is not None:
             quantized_x, swiglu_out_scale = torch.ops._C_ascend.situ_mx_quant(

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
 
-from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedExperts
+from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedExperts, SharedExpertMLPPath
 
 
 @pytest.mark.parametrize("tokens", [1, 5])
@@ -28,14 +28,19 @@ def test_unaligned_shared_activation_preserves_contract(tokens, limit):
     obj.layer = SimpleNamespace(act_fn=activation, down_proj=object())
     obj.part2 = Mock(return_value=expected)
     obj._wait_for_routed_stage = Mock()
-    submitted = SimpleNamespace(gate_up=x, hidden_states=torch.ones(tokens, 4))
+    submitted = SimpleNamespace(
+        gate_up=x, hidden_states=torch.ones(tokens, 4), path=SharedExpertMLPPath.A8_MXFP_FUSED
+    )
     milestones = SimpleNamespace(shared_activation_overlap_start=object(), routed_combine_start=object())
     with patch.object(torch.ops._C_ascend, "npu_swiglu_group_quant", create=True) as fused:
         result = obj._run_a8_mxfp_mlp(submitted, milestones)
     fused.assert_not_called()
     assert torch.equal(obj.part2.call_args.args[1], expected)
     assert torch.equal(result, expected)
-    assert obj._wait_for_routed_stage.call_count == 2
+    assert obj._wait_for_routed_stage.call_args_list == [
+        call(milestones, milestones.shared_activation_overlap_start, "shared_activation_overlap_start"),
+        call(milestones, milestones.routed_combine_start, "routed_combine_start"),
+    ]
 
 
 @pytest.mark.parametrize("width", [384, 512])

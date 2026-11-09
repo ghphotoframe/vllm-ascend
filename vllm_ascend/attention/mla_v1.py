@@ -2117,12 +2117,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             torch.empty((*shape, self.qk_rope_head_dim), dtype=self.dtype, device=device),
             torch.arange(capacity, dtype=torch.int64, device=device),
         )
-        logger.info(
-            "Prepared bounded projected MLA KV writer: layer=%s capacity=%d block_size=%d",
-            self.layer_name,
-            capacity,
-            block_size,
-        )
 
     def _exec_strided_kv_writer(self, kv_no_split, cos, sin, kv_cache, slots):
         """Normalize/rotate only current rows, then scatter into the original views."""
@@ -3663,7 +3657,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if gate is not None:
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
-        output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        output[...] = self.o_proj(o_proj_input)[0]
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

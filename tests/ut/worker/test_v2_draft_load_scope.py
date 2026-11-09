@@ -10,15 +10,11 @@ upstream load_eagle_model forwards to initialize_model.
 import ast
 import copy
 import pathlib
-import sys
 import types
 import unittest
 
 SOURCE = pathlib.Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py"
-if "--source" in sys.argv:
-    index = sys.argv.index("--source")
-    SOURCE = pathlib.Path(sys.argv[index + 1])
-    del sys.argv[index : index + 2]
+
 
 
 class LoaderBoundary:
@@ -113,7 +109,3 @@ class DraftLoadScopeTest(unittest.TestCase):
         self.assertIs(self.subject.vllm_config, self.original_config)
         self.assertEqual(second.model_config.runner_type, "draft")
         self.assertIs(second.model_config.hf_config, self.original_model_config.hf_config)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
