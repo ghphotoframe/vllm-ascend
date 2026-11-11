@@ -1239,12 +1239,12 @@ def test_input_projection_refit_rejects_runtime_buffer_contract_changes(changed)
     assert attention._ascend_input_projection_ready is False
 
 
-@pytest.mark.parametrize("tokens", [0, 1, 4, 5])
-def test_input_projection_forward_selects_only_small_batches_and_keeps_large_order(
-    tokens,
-):
-    attention = _input_projection_attention(enabled=True)
-    attention._pack_input_projection_weights()
+@pytest.mark.parametrize("tokens", [0, 1, 4, 5, 8, 128, 8192])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_input_projection_forward_uses_the_configured_path_for_all_token_rows(tokens, enabled):
+    attention = _input_projection_attention(enabled=enabled)
+    if enabled:
+        attention._pack_input_projection_weights()
     hidden = torch.full((tokens, 8), 0.125, dtype=torch.bfloat16)
     output = torch.empty_like(hidden)
     calls = []
@@ -1281,7 +1281,7 @@ def test_input_projection_forward_selects_only_small_batches_and_keeps_large_ord
             attention.forward(hidden, torch.empty(tokens), output)
         output_gate = attention.o_norm.inputs[1]
         torch.testing.assert_close(output_gate, torch.full_like(output_gate, 6.0), rtol=0, atol=0)
-        if 0 < tokens <= 4:
+        if enabled:
             gemm.assert_called_once()
             assert calls == []
         else:

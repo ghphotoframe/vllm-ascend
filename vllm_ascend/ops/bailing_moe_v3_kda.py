@@ -34,7 +34,6 @@ _KDA_MAX_RECURRENT_TOKENS = 8
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 _PACKED_INPUT_PROJECTION_NAME = "ascend_input_projection_weight"
 _KDA_INPUT_PROJECTION_ALIGNMENT = 16
-_KDA_INPUT_PROJECTION_MAX_TOKENS = 4
 _KDA_ND_WEIGHT_FORMAT = 2
 
 
@@ -164,10 +163,10 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
     ) -> None:
         del positions
         num_tokens = hidden_states.size(0)
-        if (
-            getattr(self, "_ascend_fuse_input_projections", False)
-            and 0 < num_tokens <= _KDA_INPUT_PROJECTION_MAX_TOKENS
-        ):
+        # Token count is symbolic under vLLM's broad compile range. A Python
+        # shape threshold would be fixed by the first trace and reused for
+        # other batch sizes; select one mathematical path by config only.
+        if getattr(self, "_ascend_fuse_input_projections", False):
             qkv, f_values, g_values, beta_logits = self._run_fused_input_projection(hidden_states)
             q, k, v = qkv.split(self.projection_size_per_partition, dim=-1)
             beta = (beta_logits if FLASH_KDA_ENABLED else beta_logits.float().sigmoid()).unsqueeze(0)
