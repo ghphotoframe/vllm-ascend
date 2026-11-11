@@ -45,6 +45,19 @@ def native_conv_state_supported(state: torch.Tensor, input_dtype: torch.dtype) -
     )
 
 
+def prepare_native_conv_decode(
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_slots: int,
+    null_block_id: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Prepare safe indices and skipped output rows for native fixed decode."""
+    from vllm_ascend.ops.triton.kda.conv_state import prepare_native_conv_decode as prepare
+
+    return prepare(cache_indices, query_start_loc, num_slots, null_block_id, output)
+
+
 def run_causal_conv1d(
     mixed_qkv: torch.Tensor,
     conv_weights_t: torch.Tensor,

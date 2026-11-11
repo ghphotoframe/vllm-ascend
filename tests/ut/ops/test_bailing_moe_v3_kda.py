@@ -650,6 +650,61 @@ def test_causal_conv_updates_only_active_cache_rows(layout, cache_dtype, run_mod
     assert state_sd.shape == (9, 3, 6)
 
 
+@pytest.mark.parametrize("speculative_tokens", [0, 3])
+def test_native_single_token_conv_defines_skipped_rows_without_changing_cache_ownership(speculative_tokens):
+    attention = _new_attention()
+    attention._conv_state_dim_first = False
+    attention.num_speculative_tokens = speculative_tokens
+    x = torch.randn(6, 6, dtype=torch.bfloat16)
+    cache = torch.zeros(8, 3, 6, dtype=torch.bfloat16)
+    indices = torch.tensor([2, NULL_BLOCK_ID, 5, PAD_SLOT_ID, 8, 4], dtype=torch.int32)
+    starts = torch.tensor([0, 1, 2, 2, 3, 4, 5], dtype=torch.int32)
+    valid = torch.tensor([True, False, False, False, False, True])
+
+    def prepare(cache_indices, query_start_loc, num_slots, null_block_id, out):
+        assert cache_indices is indices and query_start_loc is starts
+        assert num_slots == 8 and null_block_id == NULL_BLOCK_ID
+        out.fill_(torch.nan)
+        out[~valid] = 0
+        return torch.where(valid, indices, null_block_id)
+
+    def native(input_, state, _weight, **kwargs):
+        assert state is cache and input_ is x
+        assert kwargs["conv_state_indices"].tolist() == [2, 0, 0, 0, 0, 4]
+        out = kwargs["out"]
+        torch.testing.assert_close(out[~valid], torch.zeros_like(out[~valid]), rtol=0, atol=0)
+        if speculative_tokens == 0:
+            assert torch.isnan(out[valid]).all()
+        else:
+            assert torch.count_nonzero(out) == 0
+        out[valid] = input_[valid] + 1
+        state[[2, 4]] += 1
+        return out
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as fused,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native),
+    ):
+        out = attention._run_causal_conv1d(
+            x,
+            torch.empty(4, 6, dtype=x.dtype),
+            cache,
+            starts,
+            indices,
+            None,
+            run_mode=1,
+            max_query_len=1,
+        )
+
+    assert fused.call_count == (1 if speculative_tokens == 0 else 0)
+    expected = torch.zeros_like(x)
+    expected[valid] = x[valid] + 1
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    expected_cache = torch.zeros_like(cache)
+    expected_cache[[2, 4]] = 1
+    torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+
+
 def test_causal_conv_packed_all_null_mrv2_uses_nonnegative_sentinel():
     """FLA update filters only a configured nonnegative null-block ID."""
     attention = _new_attention()

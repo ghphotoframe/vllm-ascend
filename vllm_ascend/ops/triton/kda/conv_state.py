@@ -2,11 +2,101 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pack and restore strided convolution states for KDA."""
 
+from math import gcd
+
 import torch
 from vllm.triton_utils import tl, triton
 
 _CONV_STATE_COPY_BLOCK_SIZE = 256
 _CONV_STATE_COPY_MAX_PROGRAMS = 65535
+
+
+@triton.jit
+def _prepare_native_conv_decode_kernel(
+    indices,
+    starts,
+    normalized,
+    output,
+    index_stride,
+    start_stride,
+    output_row_stride,
+    output_column_stride,
+    num_slots,
+    REQUESTS: tl.constexpr,
+    DIM: tl.constexpr,
+    NULL_SLOT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    channel_tiles = tl.cdiv(DIM, BLOCK)
+    for tile in range(tl.program_id(0), REQUESTS * channel_tiles, tl.num_programs(0)):
+        request = tile // channel_tiles
+        channels = tile % channel_tiles * BLOCK + tl.arange(0, BLOCK)
+        slot = tl.load(indices + request * index_stride).to(tl.int64)
+        begin = tl.load(starts + request * start_stride)
+        end = tl.load(starts + (request + 1) * start_stride)
+        active = (slot > NULL_SLOT) & (slot < num_slots) & (end > begin)
+        if tile % channel_tiles == 0:
+            tl.store(normalized + request, tl.where(active, slot, NULL_SLOT))
+        # Native fixed-row decode writes every channel of active requests,
+        # but skips NULL rows. Define just those skipped rows before launch.
+        tl.store(
+            output + request * output_row_stride + channels * output_column_stride,
+            0,
+            mask=(channels < DIM) & ~active,
+        )
+
+
+def prepare_native_conv_decode(
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_slots: int,
+    null_block_id: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize fixed-row decode indices and clear skipped output rows.
+
+    The caller must select native, non-speculative, one-token-per-request
+    convolution. Active rows are left untouched: the following native update
+    must completely overwrite them. Tensor strides and storage offsets are
+    retained; output rows/channels must not overlap.
+    """
+    if cache_indices.ndim != 1 or cache_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("cache_indices must be a one-dimensional integer tensor")
+    requests = cache_indices.numel()
+    if query_start_loc.shape != (requests + 1,) or query_start_loc.dtype not in (torch.int32, torch.int64):
+        raise ValueError("query_start_loc must have one integer boundary per request plus one")
+    if output.ndim != 2 or output.shape[0] != requests or output.shape[1] <= 0:
+        raise ValueError("output must have shape [requests, positive channels]")
+    if num_slots < 0:
+        raise ValueError("num_slots must be nonnegative")
+    if cache_indices.device != output.device or query_start_loc.device != output.device:
+        raise ValueError("All convolution preparation arguments must be on the same device")
+    row_stride, column_stride = output.stride()
+    divisor = gcd(row_stride, column_stride)
+    if output.numel() > 1 and (
+        divisor == 0 or (requests > column_stride // divisor and output.shape[1] > row_stride // divisor)
+    ):
+        raise ValueError("output rows and channels must not overlap")
+    normalized = torch.empty((requests,), dtype=cache_indices.dtype, device=cache_indices.device)
+    if requests == 0:
+        return normalized
+    grid = (min(requests * triton.cdiv(output.shape[1], _CONV_STATE_COPY_BLOCK_SIZE), _CONV_STATE_COPY_MAX_PROGRAMS),)
+    _prepare_native_conv_decode_kernel[grid](
+        cache_indices,
+        query_start_loc,
+        normalized,
+        output,
+        cache_indices.stride(0),
+        query_start_loc.stride(0),
+        row_stride,
+        column_stride,
+        num_slots,
+        REQUESTS=requests,
+        DIM=output.shape[1],
+        NULL_SLOT=null_block_id,
+        BLOCK=_CONV_STATE_COPY_BLOCK_SIZE,
+    )
+    return normalized
 
 
 @triton.jit

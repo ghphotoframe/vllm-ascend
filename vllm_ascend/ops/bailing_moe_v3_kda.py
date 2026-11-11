@@ -17,7 +17,12 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm_ascend.ops.gdn_attn_builder import AscendFlashKDAAttentionBackend, AscendGDNAttentionBackend
 from vllm_ascend.ops.kda import run_recurrent_kda
 from vllm_ascend.ops.kda_backend import FLASH_KDA_ENABLED, run_chunk_kda
-from vllm_ascend.ops.kda_conv import native_conv_state_supported, pack_kda_conv_weights, run_causal_conv1d
+from vllm_ascend.ops.kda_conv import (
+    native_conv_state_supported,
+    pack_kda_conv_weights,
+    prepare_native_conv_decode,
+    run_causal_conv1d,
+)
 from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state, gather_update_conv_state
 
@@ -267,7 +272,25 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                     conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=False
                 )
 
-        if not copy_state_back:
+        conv_output = None
+        fuse_native_decode_prepare = (
+            not copy_state_back
+            and run_mode == 1
+            and max_query_len == 1
+            and num_accepted_tokens is None
+            and self.num_speculative_tokens == 0
+            and mixed_qkv.ndim == 2
+            and mixed_qkv.shape[0] == cache_indices.shape[0]
+            and mixed_qkv.dtype == torch.bfloat16
+            and cache_indices.dtype == torch.int32
+            and query_start_loc.dtype == torch.int32
+        )
+        if fuse_native_decode_prepare:
+            conv_output = torch.empty_like(mixed_qkv)
+            kernel_indices = prepare_native_conv_decode(
+                cache_indices, query_start_loc, conv_state.shape[0], null_block_id, conv_output
+            )
+        elif not copy_state_back:
             # Native fixed-row decode does not check query lengths or cache
             # bounds. Keep the staging path's inactive-row semantics when
             # passing a same-dtype SD cache (including physical page gaps).
@@ -281,6 +304,8 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             # FLA update has no pad_slot_id argument.
             kernel_indices = torch.where(kernel_indices == PAD_SLOT_ID, null_block_id, kernel_indices)
 
+        if run_mode == 1 and conv_output is None:
+            conv_output = torch.zeros_like(mixed_qkv)
         output = run_causal_conv1d(
             mixed_qkv,
             conv_weights_t,
@@ -292,7 +317,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             max_query_len=max_query_len,
             num_accepted_tokens=num_accepted_tokens,
             null_block_id=null_block_id,
-            out=torch.zeros_like(mixed_qkv) if run_mode == 1 else None,
+            out=conv_output,
         )
 
         if copy_state_back and not update_state_during_gather:
