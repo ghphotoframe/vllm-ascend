@@ -1,5 +1,6 @@
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.ops.fused_moe.moe_utils import (
     _custom_gmm_swiglu_enabled,
     _get_cann_mega_moe_quant_settings,
+    _pad_tokens_pair,
     _pad_tokens_with_cat,
     _prepare_dequant_swiglu_weight_scale,
     cumsum_group_list,
@@ -55,6 +57,135 @@ class TestTokenPadding(unittest.TestCase):
         with patch("vllm_ascend.ops.fused_moe.moe_utils.get_current_vllm_config_or_none", return_value=None):
             self.assertTrue(torch.equal(_pad_tokens_with_cat(x, 11, tp_size=8), expected))
             self.assertTrue(torch.equal(_pad_tokens_with_cat(x, 11), expected))
+
+    def test_pair_padding_preserves_values_sources_and_fresh_outputs_on_cpu(self):
+        for rows in (0, 1, 2, 4, 8):
+            for strided in (False, True):
+                with self.subTest(rows=rows, strided=strided):
+                    hidden = torch.arange(rows * 10, dtype=torch.bfloat16).reshape(rows, 10)
+                    router = torch.arange(rows * 6, dtype=torch.float32).reshape(rows, 6)
+                    if strided:
+                        hidden, router = hidden[:, ::2], router[:, ::2]
+                    originals = hidden.clone(), router.clone()
+                    expected = tuple(torch.nn.functional.pad(value, (0, 0, 0, 8 - rows)) for value in originals)
+                    actual = _pad_tokens_pair(hidden, router, 8, tp_size=8)
+                    for output, reference, source, before in zip(actual, expected, (hidden, router), originals):
+                        self.assertTrue(torch.equal(output, reference))
+                        self.assertEqual(output.dtype, source.dtype)
+                        self.assertTrue(torch.equal(source, before))
+                        if source.numel():
+                            self.assertNotEqual(output.data_ptr(), source.data_ptr())
+                        output.fill_(42)
+                        self.assertTrue(torch.equal(source, before))
+                    replay = _pad_tokens_pair(hidden, router, 8, tp_size=8)
+                    self.assertTrue(all(torch.equal(value, reference) for value, reference in zip(replay, expected)))
+
+    @staticmethod
+    def _npu_padding_input(rows, width, dtype):
+        # Eligibility uses only metadata; the device kernel is isolated below.
+        return SimpleNamespace(
+            ndim=2,
+            shape=(rows, width),
+            dtype=dtype,
+            device=SimpleNamespace(type="npu", index=0),
+            is_contiguous=lambda: True,
+        )
+
+    def test_pair_padding_submits_both_eligible_inputs_to_one_device_call(self):
+        module_name = "vllm_ascend.ops.triton.moe_token_padding"
+        kernel_module = ModuleType(module_name)
+        outputs = object(), object()
+        kernel_module.pad_tokens_pair = MagicMock(return_value=outputs)
+        for rows in (0, 1, 2, 4, 8):
+            with (
+                self.subTest(rows=rows),
+                patch.dict(sys.modules, {module_name: kernel_module}),
+                patch("vllm_ascend.ops.fused_moe.moe_utils.torch_npu.get_npu_format", return_value=2, create=True),
+            ):
+                hidden = self._npu_padding_input(rows, 2560, torch.bfloat16)
+                router = self._npu_padding_input(rows, 512, torch.float32)
+                kernel_module.pad_tokens_pair.reset_mock()
+                with patch(
+                    "vllm_ascend.ops.fused_moe.moe_utils._pad_tokens_with_cat",
+                    side_effect=AssertionError("eligible pairs must use one device call"),
+                ):
+                    self.assertIs(_pad_tokens_pair(hidden, router, 8, tp_size=8), outputs)
+                kernel_module.pad_tokens_pair.assert_called_once_with(hidden, router, 8)
+
+    def test_pair_padding_keeps_single_input_fallback_for_other_contracts(self):
+        cases = (
+            "hidden_dtype",
+            "router_dtype",
+            "hidden_stride",
+            "router_stride",
+            "cpu",
+            "device_mismatch",
+            "row_mismatch",
+            "rank",
+            "empty_width",
+            "large_batch",
+            "large_padding",
+            "no_tp",
+            "negative_padding",
+            "hidden_storage_format",
+            "router_storage_format",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                hidden = self._npu_padding_input(1, 2560, torch.bfloat16)
+                router = self._npu_padding_input(1, 512, torch.float32)
+                padded_len, tp_size = 8, 8
+                if case == "hidden_dtype":
+                    hidden.dtype = torch.float16
+                elif case == "router_dtype":
+                    router.dtype = torch.bfloat16
+                elif case == "hidden_stride":
+                    hidden.is_contiguous = lambda: False
+                elif case == "router_stride":
+                    router.is_contiguous = lambda: False
+                elif case == "cpu":
+                    hidden.device = router.device = SimpleNamespace(type="cpu", index=None)
+                elif case == "device_mismatch":
+                    router.device = SimpleNamespace(type="npu", index=1)
+                elif case == "row_mismatch":
+                    router.shape = (2, 512)
+                elif case == "rank":
+                    router.ndim, router.shape = 3, (1, 1, 512)
+                elif case == "empty_width":
+                    hidden.shape = (1, 0)
+                elif case == "large_batch":
+                    hidden.shape, router.shape, padded_len = (9, 2560), (9, 512), 10
+                elif case == "large_padding":
+                    padded_len = 10
+                elif case == "no_tp":
+                    tp_size = None
+                elif case == "negative_padding":
+                    padded_len = 0
+                outputs = object(), object()
+                with (
+                    patch(
+                        "vllm_ascend.ops.fused_moe.moe_utils._pad_tokens_with_cat", side_effect=outputs
+                    ) as single_pad,
+                    patch(
+                        "vllm_ascend.ops.fused_moe.moe_utils.torch_npu.get_npu_format",
+                        side_effect=lambda value, case=case, hidden=hidden, router=router: 29
+                        if (case == "hidden_storage_format" and value is hidden)
+                        or (case == "router_storage_format" and value is router)
+                        else 2,
+                        create=True,
+                    ),
+                ):
+                    self.assertEqual(_pad_tokens_pair(hidden, router, padded_len, tp_size=tp_size), outputs)
+                self.assertEqual(single_pad.call_count, 2)
+                self.assertEqual(single_pad.call_args_list[0].args, (hidden, padded_len))
+                self.assertEqual(single_pad.call_args_list[1].args, (router, padded_len))
+                self.assertTrue(all(call.kwargs == {"tp_size": tp_size} for call in single_pad.call_args_list))
+
+    def test_pair_padding_retains_negative_padding_assertion(self):
+        hidden = torch.ones(1, 4, dtype=torch.bfloat16)
+        router = torch.ones(1, 2, dtype=torch.float32)
+        with self.assertRaises(AssertionError):
+            _pad_tokens_pair(hidden, router, 0, tp_size=8)
 
 
 class TestCumsumGroupList(unittest.TestCase):

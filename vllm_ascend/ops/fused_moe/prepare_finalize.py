@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.lora.fused_moe import prepare_lora_indices
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
-from vllm_ascend.ops.fused_moe.moe_utils import _pad_tokens_with_cat
+from vllm_ascend.ops.fused_moe.moe_utils import _pad_tokens_pair
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 
@@ -160,8 +160,9 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
                 )
 
             if pad_size > 0:
-                hidden_states = _pad_tokens_with_cat(hidden_states, self.num_tokens + pad_size, tp_size=self.tp_size)
-                router_logits = _pad_tokens_with_cat(router_logits, self.num_tokens + pad_size, tp_size=self.tp_size)
+                hidden_states, router_logits = _pad_tokens_pair(
+                    hidden_states, router_logits, self.num_tokens + pad_size, tp_size=self.tp_size
+                )
                 padded_hidden_states_shape = hidden_states.shape
 
             if self.tp_size > 1:
@@ -294,8 +295,9 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             pad_size = target_pad_length - self.num_tokens
 
             if pad_size > 0:
-                hidden_states = _pad_tokens_with_cat(hidden_states, target_pad_length, tp_size=self.tp_size)
-                router_logits = _pad_tokens_with_cat(router_logits, target_pad_length, tp_size=self.tp_size)
+                hidden_states, router_logits = _pad_tokens_pair(
+                    hidden_states, router_logits, target_pad_length, tp_size=self.tp_size
+                )
                 padded_hidden_states_shape = hidden_states.shape
 
             # Slice across TP ranks

@@ -49,6 +49,7 @@ _CANN_ACL_FLOAT8_E5M2 = 23
 _CANN_ACL_FLOAT8_E4M3FN = 24
 _CANN_ACL_FLOAT4_E2M1 = 296
 _SWIGLUSTEP_DEFAULT_LIMIT = 7.0
+_NPU_FORMAT_ND = 2
 
 # dict: QuantType -> (dispatch_quant_mode, dispatch_quant_out_dtype, weight_type)
 _QUANT_SETTING_MAP: dict[QuantType, tuple[int, int | None, int | None]] = {
@@ -436,6 +437,41 @@ def enable_fusion_gmmswigluquant():
 # for Kimi K3 TP16: hidden 3584, experts 896), each tp_size * width *
 # dtype.itemsize bytes, so the whole cache peaks at O(0.1) MB.
 _PAD_ZERO_BLOCKS: dict[tuple, torch.Tensor] = {}
+
+
+def _pad_tokens_pair(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    padded_len: int,
+    *,
+    tp_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse the small-batch BF16/FP32 pair inside the opaque MoE forward."""
+    if (
+        hidden_states.ndim == router_logits.ndim == 2
+        and hidden_states.shape[0] == router_logits.shape[0]
+        and hidden_states.shape[1] > 0
+        and router_logits.shape[1] > 0
+        and hidden_states.dtype == torch.bfloat16
+        and router_logits.dtype == torch.float32
+        and hidden_states.device.type == "npu"
+        and hidden_states.device == router_logits.device
+        and hidden_states.is_contiguous()
+        and router_logits.is_contiguous()
+        and tp_size is not None
+        and 0 <= hidden_states.shape[0] <= tp_size
+        and 0 <= padded_len - hidden_states.shape[0] <= tp_size
+        and torch_npu.get_npu_format(hidden_states) == _NPU_FORMAT_ND
+        and torch_npu.get_npu_format(router_logits) == _NPU_FORMAT_ND
+    ):
+        # CPU and other layouts do not need to import the device kernel.
+        from vllm_ascend.ops.triton.moe_token_padding import pad_tokens_pair
+
+        return pad_tokens_pair(hidden_states, router_logits, padded_len)
+    return (
+        _pad_tokens_with_cat(hidden_states, padded_len, tp_size=tp_size),
+        _pad_tokens_with_cat(router_logits, padded_len, tp_size=tp_size),
+    )
 
 
 def _pad_tokens_with_cat(x: torch.Tensor, padded_len: int, *, tp_size: int | None = None) -> torch.Tensor:
