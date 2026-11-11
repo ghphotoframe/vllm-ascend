@@ -160,8 +160,8 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
                 )
 
             if pad_size > 0:
-                hidden_states = _pad_tokens_with_cat(hidden_states, self.num_tokens + pad_size)
-                router_logits = _pad_tokens_with_cat(router_logits, self.num_tokens + pad_size)
+                hidden_states = _pad_tokens_with_cat(hidden_states, self.num_tokens + pad_size, tp_size=self.tp_size)
+                router_logits = _pad_tokens_with_cat(router_logits, self.num_tokens + pad_size, tp_size=self.tp_size)
                 padded_hidden_states_shape = hidden_states.shape
 
             if self.tp_size > 1:
@@ -294,8 +294,8 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             pad_size = target_pad_length - self.num_tokens
 
             if pad_size > 0:
-                hidden_states = _pad_tokens_with_cat(hidden_states, target_pad_length)
-                router_logits = _pad_tokens_with_cat(router_logits, target_pad_length)
+                hidden_states = _pad_tokens_with_cat(hidden_states, target_pad_length, tp_size=self.tp_size)
+                router_logits = _pad_tokens_with_cat(router_logits, target_pad_length, tp_size=self.tp_size)
                 padded_hidden_states_shape = hidden_states.shape
 
             # Slice across TP ranks

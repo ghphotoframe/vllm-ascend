@@ -40,6 +40,37 @@ class TestPrepareAndFinalize(unittest.TestCase):
         config_context.__enter__()
         self.addCleanup(config_context.__exit__, None, None, None)
 
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=8)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_physical_tp_padding_without_current_config(self, mock_context, mock_tp_rank, mock_tp_size):
+        # EP can report routed-expert TP=1; token slicing still follows TP8.
+        self.moe_config.tp_size = 1
+        for tokens in (1, 2, 4):
+            hidden = torch.arange(tokens * 8, dtype=torch.bfloat16).reshape(tokens, 8)
+            logits = torch.arange(tokens * 2, dtype=torch.float32).reshape(tokens, 2)
+            expected_hidden = torch.nn.functional.pad(hidden, (0, 0, 0, 8 - tokens))
+            expected_logits = torch.nn.functional.pad(logits, (0, 0, 0, 8 - tokens))
+            context = MagicMock()
+            context.mc2_mask = torch.arange(8) < tokens
+            context.padded_num_tokens = 8
+            mock_context.return_value = context
+            for implementation in (PrepareAndFinalizeWithMC2, PrepareAndFinalizeWithAll2All):
+                for rank in range(8):
+                    with self.subTest(tokens=tokens, implementation=implementation.__name__, rank=rank):
+                        mock_tp_rank.return_value = rank
+                        layer = implementation(self.moe_config)
+                        with (
+                            patch(
+                                "vllm_ascend.ops.fused_moe.moe_utils.get_current_vllm_config_or_none", return_value=None
+                            ),
+                            patch("torch.nn.functional.pad", side_effect=AssertionError("unexpected padding fallback")),
+                        ):
+                            prepared = layer.prepare(hidden, logits)
+                        torch.testing.assert_close(prepared.hidden_states, expected_hidden[rank : rank + 1])
+                        torch.testing.assert_close(prepared.router_logits, expected_logits[rank : rank + 1])
+                        self.assertEqual(prepared.padded_hidden_states_shape, torch.Size([8, 8]))
+
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")

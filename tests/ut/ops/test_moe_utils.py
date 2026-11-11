@@ -10,12 +10,51 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.ops.fused_moe.moe_utils import (
     _custom_gmm_swiglu_enabled,
     _get_cann_mega_moe_quant_settings,
+    _pad_tokens_with_cat,
     _prepare_dequant_swiglu_weight_scale,
     cumsum_group_list,
     load_cann_mega_moe_ops,
     select_mega_moe_activation_kwargs,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+
+
+class TestTokenPadding(unittest.TestCase):
+    def test_explicit_tp_preserves_padding_without_current_config(self):
+        # V2 capture can run without the initialization-only config context.
+        # The caller still knows its physical TP size, including under EP.
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for tokens, padded in ((0, 8), (1, 8), (2, 8), (4, 8), (8, 8)):
+                with (
+                    self.subTest(dtype=dtype, tokens=tokens),
+                    patch.dict("vllm_ascend.ops.fused_moe.moe_utils._PAD_ZERO_BLOCKS", {}, clear=True),
+                ):
+                    x = torch.arange(tokens * 12, dtype=dtype).reshape(tokens, 12)[:, ::2]
+                    expected = torch.nn.functional.pad(x, (0, 0, 0, padded - tokens))
+                    with (
+                        patch("vllm_ascend.ops.fused_moe.moe_utils.get_current_vllm_config_or_none", return_value=None),
+                        patch("torch.nn.functional.pad", side_effect=AssertionError("unexpected padding fallback")),
+                    ):
+                        actual = _pad_tokens_with_cat(x, padded, tp_size=8)
+                    self.assertTrue(torch.equal(actual, expected))
+                    actual.fill_(42)
+                    replay = _pad_tokens_with_cat(x, padded, tp_size=8)
+                    self.assertTrue(torch.equal(replay, expected))
+
+    def test_tp_changes_do_not_reuse_a_shorter_zero_block(self):
+        with patch.dict("vllm_ascend.ops.fused_moe.moe_utils._PAD_ZERO_BLOCKS", {}, clear=True):
+            x = torch.tensor([[1.0, -2.0]])
+            for tp_size in (2, 8, 4, 16, 2):
+                with self.subTest(tp_size=tp_size):
+                    expected = torch.nn.functional.pad(x, (0, 0, 0, tp_size - 1))
+                    self.assertTrue(torch.equal(_pad_tokens_with_cat(x, tp_size, tp_size=tp_size), expected))
+
+    def test_oversized_padding_keeps_fallback_and_two_argument_calls(self):
+        x = torch.tensor([[1.0, -2.0]])
+        expected = torch.nn.functional.pad(x, (0, 0, 0, 10))
+        with patch("vllm_ascend.ops.fused_moe.moe_utils.get_current_vllm_config_or_none", return_value=None):
+            self.assertTrue(torch.equal(_pad_tokens_with_cat(x, 11, tp_size=8), expected))
+            self.assertTrue(torch.equal(_pad_tokens_with_cat(x, 11), expected))
 
 
 class TestCumsumGroupList(unittest.TestCase):
