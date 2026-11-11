@@ -221,3 +221,178 @@ def test_native_decode_preparation_empty_compaction_never_launches_or_checks_sto
         result = prepare_native_conv_decode(indices, starts, 0, 0, output, input_tensor=source, packed_input=packed)
     assert result.shape == (0,)
     kernel.__getitem__.assert_not_called()
+
+
+def _raw_gate_prepare_inputs(rows=2, width=8):
+    stride, offset = 5 * width + 16, 16
+    backing = torch.arange(offset + rows * stride + 64, dtype=torch.float32).bfloat16()
+    qkv = backing.as_strided((rows, 3 * width), (stride, 1), offset)
+    gate = backing.as_strided((rows, width), (stride, 1), offset + 3 * width)
+    return dict(
+        cache_indices=torch.arange(1, rows + 1, dtype=torch.int32),
+        query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+        num_slots=8,
+        null_block_id=0,
+        output=torch.empty(rows, 3 * width, dtype=torch.bfloat16),
+        input_tensor=qkv,
+        packed_input=torch.empty(rows, 3 * width, dtype=torch.bfloat16),
+        gate_tensor=gate,
+        packed_gate=torch.empty(rows, width, dtype=torch.bfloat16),
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4])
+@pytest.mark.parametrize("strided_metadata", [False, True])
+def test_gate_prepare_uses_integer_views_and_allows_shared_read_only_sources(rows, strided_metadata):
+    values = _raw_gate_prepare_inputs(rows)
+    if strided_metadata:
+        for key in ("cache_indices", "query_start_loc"):
+            value = values[key]
+            backing = torch.empty(2 * value.numel() + 1, dtype=value.dtype)
+            backing[1::2].copy_(value)
+            values[key] = backing[1::2]
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("no metadata D2H")),
+    ):
+        normalized = prepare_native_conv_decode(**values)
+    options = kernel.__getitem__.return_value.call_args.kwargs
+    assert options["PACK_INPUT"] is options["PACK_GATE"] is True
+    assert options["GATE_INPUT"].dtype == options["PACKED_GATE"].dtype == torch.int16
+    assert options["GATE_INPUT"].shape == values["gate_tensor"].shape
+    assert options["GATE_INPUT"].storage_offset() == values["gate_tensor"].storage_offset()
+    assert options["GATE_INPUT"].untyped_storage().data_ptr() == values["input_tensor"].untyped_storage().data_ptr()
+    assert options["GATE_ROW_STRIDE"] == values["gate_tensor"].stride(0)
+    assert options["PACKED_GATE"].untyped_storage().data_ptr() == values["packed_gate"].untyped_storage().data_ptr()
+    assert normalized.dtype == torch.int32 and normalized.shape == (rows,)
+
+
+@pytest.mark.parametrize("which", ["none", "qkv"])
+def test_gate_prepare_default_does_not_add_gate_options_to_existing_kernel_call(which):
+    values = _raw_gate_prepare_inputs()
+    values.pop("gate_tensor")
+    values.pop("packed_gate")
+    if which == "none":
+        values.pop("input_tensor")
+        values.pop("packed_input")
+    with patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel:
+        prepare_native_conv_decode(**values)
+    options = kernel.__getitem__.return_value.call_args.kwargs
+    assert "GATE_INPUT" not in options and "PACK_GATE" not in options
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "out_gate_source",
+        "qkv_target_gate_source",
+        "gate_target_gate_source",
+        "gate_target_qkv_source",
+        "gate_target_out",
+        "gate_target_qkv_target",
+        "gate_target_indices",
+        "gate_target_starts",
+    ],
+)
+def test_gate_prepare_rejects_write_aliases_but_not_the_shared_read_backing(alias):
+    values = _raw_gate_prepare_inputs()
+    shape = values["packed_gate"].shape
+    if alias == "out_gate_source":
+        values["output"] = values["gate_tensor"].as_strided(values["output"].shape, (24, 1), 128)
+    elif alias == "qkv_target_gate_source":
+        values["packed_input"] = values["gate_tensor"].as_strided(values["packed_input"].shape, (24, 1), 128)
+    elif alias == "gate_target_gate_source":
+        values["packed_gate"] = values["gate_tensor"].as_strided(shape, (8, 1), 128)
+    elif alias == "gate_target_qkv_source":
+        values["packed_gate"] = values["input_tensor"].as_strided(shape, (8, 1), 128)
+    elif alias == "gate_target_out":
+        values["packed_gate"] = values["output"].view(-1)[:16].view(shape)
+    elif alias == "gate_target_qkv_target":
+        values["packed_gate"] = values["packed_input"].view(-1)[:16].view(shape)
+    else:
+        backing = torch.empty(128, dtype=torch.int32)
+        key = "cache_indices" if alias == "gate_target_indices" else "query_start_loc"
+        target = values[key]
+        values[key] = backing[: target.numel()]
+        values[key].copy_(target)
+        values["packed_gate"] = backing.view(torch.bfloat16)[:16].view(shape)
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        pytest.raises(ValueError, match="separate storage"),
+    ):
+        prepare_native_conv_decode(**values)
+    kernel.__getitem__.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "source_only",
+        "target_only",
+        "gate_only",
+        "shape",
+        "source_dtype",
+        "target_dtype",
+        "column_stride",
+        "row_overlap",
+        "target_stride",
+        "qkv_width",
+    ],
+)
+def test_gate_prepare_rejects_unsupported_contracts_before_launch(invalid):
+    values = _raw_gate_prepare_inputs()
+    if invalid == "source_only":
+        values.pop("packed_gate")
+    elif invalid == "target_only":
+        values.pop("gate_tensor")
+    elif invalid == "gate_only":
+        values.pop("input_tensor")
+        values.pop("packed_input")
+    elif invalid == "shape":
+        values["gate_tensor"] = values["gate_tensor"][:, :-1]
+    elif invalid == "source_dtype":
+        values["gate_tensor"] = values["gate_tensor"].float()
+    elif invalid == "target_dtype":
+        values["packed_gate"] = values["packed_gate"].float()
+    elif invalid == "column_stride":
+        values["gate_tensor"] = torch.empty(2, 16, dtype=torch.bfloat16)[:, ::2]
+    elif invalid == "row_overlap":
+        values["gate_tensor"] = torch.empty(2, 8, dtype=torch.bfloat16).as_strided((2, 8), (4, 1))
+    elif invalid == "target_stride":
+        values["packed_gate"] = torch.empty(2, 16, dtype=torch.bfloat16)[:, :8]
+    else:
+        values["output"] = values["output"][:, :-1]
+        values["input_tensor"] = values["input_tensor"][:, :-1]
+        values["packed_input"] = torch.empty(2, 23, dtype=torch.bfloat16)
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        pytest.raises(ValueError),
+    ):
+        prepare_native_conv_decode(**values)
+    kernel.__getitem__.assert_not_called()
+
+
+def test_gate_prepare_empty_requests_keep_the_existing_no_launch_contract():
+    values = _raw_gate_prepare_inputs(rows=0)
+    with patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel:
+        normalized = prepare_native_conv_decode(**values)
+    assert normalized.numel() == 0
+    kernel.__getitem__.assert_not_called()
+
+
+def test_gate_preparation_public_wrapper_keeps_existing_return_and_forwards_only_explicit_options():
+    values = _raw_gate_prepare_inputs()
+    with patch("vllm_ascend.ops.triton.kda.conv_state.prepare_native_conv_decode") as inner:
+        result = prepare_native_conv_decode(**values)
+    inner.assert_called_once_with(
+        values["cache_indices"],
+        values["query_start_loc"],
+        values["num_slots"],
+        values["null_block_id"],
+        values["output"],
+        input_tensor=values["input_tensor"],
+        packed_input=values["packed_input"],
+        gate_tensor=values["gate_tensor"],
+        packed_gate=values["packed_gate"],
+    )
+    assert result is inner.return_value

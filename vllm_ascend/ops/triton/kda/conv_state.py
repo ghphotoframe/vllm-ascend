@@ -30,6 +30,10 @@ def _prepare_native_conv_decode_kernel(
     PACKED_INPUT=None,
     INPUT_ROW_STRIDE: tl.constexpr = 0,
     PACK_INPUT: tl.constexpr = False,
+    GATE_INPUT=None,
+    PACKED_GATE=None,
+    GATE_ROW_STRIDE: tl.constexpr = 0,
+    PACK_GATE: tl.constexpr = False,
 ):
     channel_tiles = tl.cdiv(DIM, BLOCK)
     for tile in range(tl.program_id(0), REQUESTS * channel_tiles, tl.num_programs(0)):
@@ -51,8 +55,26 @@ def _prepare_native_conv_decode_kernel(
         if PACK_INPUT:
             # The same-size integer views preserve all BF16 payload bits.
             source_column = tl.minimum(channels, DIM - 1)
-            payload = tl.load(INPUT + request * INPUT_ROW_STRIDE + source_column, channels < DIM, other=0)
+            payload = tl.load(
+                INPUT + request * INPUT_ROW_STRIDE + source_column,
+                channels < DIM,
+                other=0,
+            )
             tl.store(PACKED_INPUT + request * DIM + channels, payload, channels < DIM)
+        if PACK_GATE:
+            gate_width = DIM // 3
+            gate_column = tl.minimum(channels, gate_width - 1)
+            gate_payload = tl.load(
+                GATE_INPUT + request * GATE_ROW_STRIDE + gate_column,
+                channels < gate_width,
+                other=0,
+            )
+            # Copy every F row, including NULL/empty-query rows, as contiguous() did.
+            tl.store(
+                PACKED_GATE + request * gate_width + channels,
+                gate_payload,
+                channels < gate_width,
+            )
 
 
 def prepare_native_conv_decode(
@@ -64,6 +86,8 @@ def prepare_native_conv_decode(
     *,
     input_tensor: torch.Tensor | None = None,
     packed_input: torch.Tensor | None = None,
+    gate_tensor: torch.Tensor | None = None,
+    packed_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize fixed-row decode indices and clear skipped output rows.
 
@@ -75,7 +99,10 @@ def prepare_native_conv_decode(
     if cache_indices.ndim != 1 or cache_indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("cache_indices must be a one-dimensional integer tensor")
     requests = cache_indices.numel()
-    if query_start_loc.shape != (requests + 1,) or query_start_loc.dtype not in (torch.int32, torch.int64):
+    if query_start_loc.shape != (requests + 1,) or query_start_loc.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
         raise ValueError("query_start_loc must have one integer boundary per request plus one")
     if output.ndim != 2 or output.shape[0] != requests or output.shape[1] <= 0:
         raise ValueError("output must have shape [requests, positive channels]")
@@ -110,10 +137,47 @@ def prepare_native_conv_decode(
                 # A program can clear output while another copies input;
                 # reject even disjoint views of one storage conservatively.
                 raise ValueError("Compaction source, destination, and output must use separate storage")
+    if (gate_tensor is None) != (packed_gate is None):
+        raise ValueError("Gate packing requires both source and destination")
+    if gate_tensor is not None:
+        if input_tensor is None:
+            raise ValueError("Gate packing requires QKV compaction in the same preparation")
+        gate_width = output.shape[1] // 3
+        if (
+            output.shape[1] % 3
+            or gate_tensor.shape != (requests, gate_width)
+            or packed_gate.shape != gate_tensor.shape
+            or gate_tensor.dtype != torch.bfloat16
+            or packed_gate.dtype != torch.bfloat16
+            or gate_tensor.device != output.device
+            or packed_gate.device != output.device
+            or gate_tensor.stride(1) != 1
+            or gate_tensor.stride(0) < gate_width
+            or not packed_gate.is_contiguous()
+        ):
+            raise ValueError("Gate packing requires same-shape/device BF16 [requests, QKV_width/3] views")
+        if requests > 0:
+            reads = {
+                tensor.untyped_storage().data_ptr()
+                for tensor in (
+                    input_tensor,
+                    gate_tensor,
+                    cache_indices,
+                    query_start_loc,
+                )
+            }
+            writes = [tensor.untyped_storage().data_ptr() for tensor in (output, packed_input, packed_gate)]
+            if len(set(writes)) != len(writes) or set(writes) & reads:
+                raise ValueError("Gate packing destinations/output must use separate storage from all sources")
     normalized = torch.empty((requests,), dtype=cache_indices.dtype, device=cache_indices.device)
     if requests == 0:
         return normalized
-    grid = (min(requests * triton.cdiv(output.shape[1], _CONV_STATE_COPY_BLOCK_SIZE), _CONV_STATE_COPY_MAX_PROGRAMS),)
+    grid = (
+        min(
+            requests * triton.cdiv(output.shape[1], _CONV_STATE_COPY_BLOCK_SIZE),
+            _CONV_STATE_COPY_MAX_PROGRAMS,
+        ),
+    )
     copy_options = (
         {}
         if input_tensor is None
@@ -124,6 +188,13 @@ def prepare_native_conv_decode(
             "PACK_INPUT": True,
         }
     )
+    if gate_tensor is not None:
+        copy_options.update(
+            GATE_INPUT=gate_tensor.view(torch.int16),
+            PACKED_GATE=packed_gate.view(torch.int16),
+            GATE_ROW_STRIDE=gate_tensor.stride(0),
+            PACK_GATE=True,
+        )
     _prepare_native_conv_decode_kernel[grid](
         cache_indices,
         query_start_loc,
@@ -203,11 +274,17 @@ def _gather_update_conv_state_kernel(
         # old gather/scatter still rounds them through BF16. Rows and channels
         # do not overlap, so each tail row can be loaded and restored in turn.
         for state_row in range(3, STATE_LEN):
-            tail = tl.load(cache_row + state_row * STATE_STRIDE + offsets, mask=active_channels, other=0).to(
-                packed.dtype.element_ty
-            )
+            tail = tl.load(
+                cache_row + state_row * STATE_STRIDE + offsets,
+                mask=active_channels,
+                other=0,
+            ).to(packed.dtype.element_ty)
             tl.store(packed_row + state_row * DIM + channels, tail, mask=in_range)
-            tl.store(cache_row + state_row * STATE_STRIDE + offsets, tail, mask=active_channels)
+            tl.store(
+                cache_row + state_row * STATE_STRIDE + offsets,
+                tail,
+                mask=active_channels,
+            )
         if tile % channel_tiles == 0:
             # FLA update has no PAD_SLOT_ID argument. The past-end packed row
             # is explicitly supplied as its null_block_id and never accessed.
@@ -258,7 +335,10 @@ def gather_update_conv_state(
         raise ValueError("cache_indices must be a one-dimensional integer tensor")
     if x.shape[0] != requests:
         raise ValueError("Fixed-row decode requires exactly one x row per request")
-    if query_start_loc.shape != (requests + 1,) or query_start_loc.dtype not in (torch.int32, torch.int64):
+    if query_start_loc.shape != (requests + 1,) or query_start_loc.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
         raise ValueError("query_start_loc must have one integer boundary per request plus one")
     if packed.shape != (requests, state_len, dim) or packed.dtype != torch.bfloat16 or not packed.is_contiguous():
         raise ValueError("packed must be a contiguous BF16 [requests, state_len, dim] tensor")
@@ -273,7 +353,12 @@ def gather_update_conv_state(
         raise ValueError("State history/channel axes and cache slots must not overlap")
     if requests == 0:
         return
-    grid = (min(requests * triton.cdiv(dim, _CONV_STATE_COPY_BLOCK_SIZE), _CONV_STATE_COPY_MAX_PROGRAMS),)
+    grid = (
+        min(
+            requests * triton.cdiv(dim, _CONV_STATE_COPY_BLOCK_SIZE),
+            _CONV_STATE_COPY_MAX_PROGRAMS,
+        ),
+    )
     _gather_update_conv_state_kernel[grid](
         cache,
         packed,
@@ -358,7 +443,12 @@ def copy_conv_state(
     if requests == 0:
         return
     state_len, dim = cache.shape[1:]
-    grid = (min(requests * state_len * triton.cdiv(dim, _CONV_STATE_COPY_BLOCK_SIZE), _CONV_STATE_COPY_MAX_PROGRAMS),)
+    grid = (
+        min(
+            requests * state_len * triton.cdiv(dim, _CONV_STATE_COPY_BLOCK_SIZE),
+            _CONV_STATE_COPY_MAX_PROGRAMS,
+        ),
+    )
     _copy_conv_state_kernel[grid](
         cache,
         packed,

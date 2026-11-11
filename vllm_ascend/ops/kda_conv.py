@@ -54,11 +54,23 @@ def prepare_native_conv_decode(
     *,
     input_tensor: torch.Tensor | None = None,
     packed_input: torch.Tensor | None = None,
+    gate_tensor: torch.Tensor | None = None,
+    packed_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prepare native fixed decode, optionally compacting a row-gap input."""
-    from vllm_ascend.ops.triton.kda.conv_state import prepare_native_conv_decode as prepare
+    from vllm_ascend.ops.triton.kda.conv_state import (
+        prepare_native_conv_decode as prepare,
+    )
 
-    if input_tensor is None and packed_input is None:
+    gate_options = (
+        {}
+        if gate_tensor is None and packed_gate is None
+        else {
+            "gate_tensor": gate_tensor,
+            "packed_gate": packed_gate,
+        }
+    )
+    if input_tensor is None and packed_input is None and not gate_options:
         return prepare(cache_indices, query_start_loc, num_slots, null_block_id, output)
     return prepare(
         cache_indices,
@@ -68,6 +80,7 @@ def prepare_native_conv_decode(
         output,
         input_tensor=input_tensor,
         packed_input=packed_input,
+        **gate_options,
     )
 
 

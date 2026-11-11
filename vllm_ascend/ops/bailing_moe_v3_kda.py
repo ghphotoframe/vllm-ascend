@@ -17,7 +17,10 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
-from vllm_ascend.ops.gdn_attn_builder import AscendFlashKDAAttentionBackend, AscendGDNAttentionBackend
+from vllm_ascend.ops.gdn_attn_builder import (
+    AscendFlashKDAAttentionBackend,
+    AscendGDNAttentionBackend,
+)
 from vllm_ascend.ops.kda import run_recurrent_kda
 from vllm_ascend.ops.kda_backend import FLASH_KDA_ENABLED, run_chunk_kda
 from vllm_ascend.ops.kda_conv import (
@@ -27,7 +30,10 @@ from vllm_ascend.ops.kda_conv import (
     run_causal_conv1d,
 )
 from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
-from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state, gather_update_conv_state
+from vllm_ascend.ops.triton.kda.conv_state import (
+    copy_conv_state,
+    gather_update_conv_state,
+)
 from vllm_ascend.utils import maybe_trans_nz
 
 _KDA_MAX_RECURRENT_TOKENS = 8
@@ -373,7 +379,11 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         run_mode: int,
         max_query_len: int = -1,
         num_accepted_tokens: torch.Tensor | None = None,
+        gate_tensor: torch.Tensor | None = None,
+        packed_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if (gate_tensor is None) != (packed_gate is None):
+            raise ValueError("Gate packing requires both source and destination")
         if run_mode not in (0, 1):
             raise ValueError(f"Unsupported causal_conv1d run_mode: {run_mode}")
         # Convolution uses one history buffer per request, including MTP.
@@ -383,9 +393,55 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             raise ValueError(f"KDA causal cache_indices must be 1D or 2D, got shape={tuple(cache_indices.shape)}")
         cache_indices = cache_indices.contiguous()
         if cache_indices.shape[0] == 0:
+            if gate_tensor is not None:
+                raise ValueError("Gate packing requires nonempty native decode")
             return torch.zeros_like(mixed_qkv)
 
         conv_state = conv_state_storage.transpose(-1, -2) if self._conv_state_dim_first else conv_state_storage
+        fuse_native_decode_prepare = (
+            run_mode == 1
+            and max_query_len == 1
+            and num_accepted_tokens is None
+            and mixed_qkv.ndim == 2
+            and _native_decode_prepare_compatible(
+                mixed_qkv.shape[0],
+                mixed_qkv.dtype,
+                conv_state,
+                cache_indices,
+                query_start_loc,
+                self.num_speculative_tokens,
+            )
+        )
+        gate_options = {}
+        if gate_tensor is not None:
+            # Reject before any staging operation can update the cache.
+            if not fuse_native_decode_prepare or mixed_qkv.is_contiguous():
+                raise ValueError("Gate packing requires native fixed decode and QKV compaction")
+            if (
+                gate_tensor.ndim != 4
+                or gate_tensor.shape[:2] != (1, mixed_qkv.shape[0])
+                or gate_tensor.shape[-2] * gate_tensor.shape[-1] * 3 != mixed_qkv.shape[1]
+                or packed_gate.shape != gate_tensor.shape
+                or gate_tensor.dtype != torch.bfloat16
+                or packed_gate.dtype != gate_tensor.dtype
+                or gate_tensor.device != mixed_qkv.device
+                or packed_gate.device != mixed_qkv.device
+                or gate_tensor.stride(-1) != 1
+                or gate_tensor.stride(-2) != gate_tensor.shape[-1]
+                or gate_tensor.stride(-3) < mixed_qkv.shape[1] // 3
+                or not packed_gate.is_contiguous()
+            ):
+                raise ValueError("Gate packing requires compatible BF16 [1, tokens, heads, dim] views")
+            protected_storage = {
+                tensor.untyped_storage().data_ptr() for tensor in (conv_state_storage, cache_indices, query_start_loc)
+            }
+            if packed_gate.untyped_storage().data_ptr() in protected_storage:
+                raise ValueError("Packed gate must not alias convolution state or metadata")
+            width = mixed_qkv.shape[1] // 3
+            gate_options = {
+                "gate_tensor": gate_tensor[0].view(mixed_qkv.shape[0], width),
+                "packed_gate": packed_gate[0].view(mixed_qkv.shape[0], width),
+            }
         kernel_state = conv_state
         kernel_indices = cache_indices
         null_block_id = NULL_BLOCK_ID
@@ -439,31 +495,26 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             else:
                 cache_indices = torch.where(cache_indices == NULL_BLOCK_ID, PAD_SLOT_ID, cache_indices)
                 copy_conv_state(
-                    conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=False
+                    conv_state,
+                    kernel_state,
+                    cache_indices,
+                    query_start_loc,
+                    kernel_indices,
+                    write_back=False,
                 )
 
         conv_output = None
-        fuse_native_decode_prepare = (
-            run_mode == 1
-            and max_query_len == 1
-            and num_accepted_tokens is None
-            and mixed_qkv.ndim == 2
-            and _native_decode_prepare_compatible(
-                mixed_qkv.shape[0],
-                mixed_qkv.dtype,
-                conv_state,
-                cache_indices,
-                query_start_loc,
-                self.num_speculative_tokens,
-            )
-        )
         if fuse_native_decode_prepare:
             if mixed_qkv.is_contiguous():
                 # CC1 and genuinely packed projections retain the original
                 # prepare kernel, with no projection copy.
                 conv_output = torch.empty_like(mixed_qkv)
                 kernel_indices = prepare_native_conv_decode(
-                    cache_indices, query_start_loc, conv_state.shape[0], null_block_id, conv_output
+                    cache_indices,
+                    query_start_loc,
+                    conv_state.shape[0],
+                    null_block_id,
+                    conv_output,
                 )
             else:
                 packed_input = torch.empty(mixed_qkv.shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
@@ -476,6 +527,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                     conv_output,
                     input_tensor=mixed_qkv,
                     packed_input=packed_input,
+                    **gate_options,
                 )
                 mixed_qkv = packed_input
         elif not copy_state_back:
@@ -509,7 +561,14 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         )
 
         if copy_state_back and not update_state_during_gather:
-            copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=True)
+            copy_conv_state(
+                conv_state,
+                kernel_state,
+                cache_indices,
+                query_start_loc,
+                kernel_indices,
+                write_back=True,
+            )
         return output
 
     def _run_recurrent(
@@ -734,6 +793,19 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 decode_meta = attn_metadata.non_spec_decode_metadata
                 assert decode_meta is not None
                 conv_meta = decode_meta.causal_conv1d
+                packed_decode_gate = None
+                gate_options = {}
+                if (
+                    defer_qkv_pack
+                    and not mixed_non_spec.is_contiguous()
+                    and gate_non_spec is not None
+                    and not gate_non_spec.is_contiguous()
+                ):
+                    packed_decode_gate = torch.empty_like(gate_non_spec, memory_format=torch.contiguous_format)
+                    gate_options = {
+                        "gate_tensor": gate_non_spec,
+                        "packed_gate": packed_decode_gate,
+                    }
                 mixed_non_spec = self._run_causal_conv1d(
                     mixed_non_spec,
                     conv_weights_t,
@@ -743,7 +815,10 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                     None,
                     run_mode=1,
                     max_query_len=1,
+                    **gate_options,
                 )
+                if packed_decode_gate is not None:
+                    gate_non_spec = packed_decode_gate
 
             q_non_spec, k_non_spec, v_non_spec = (
                 rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim) for x in mixed_non_spec.chunk(3, dim=-1)

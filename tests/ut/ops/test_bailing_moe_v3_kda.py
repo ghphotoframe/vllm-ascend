@@ -1418,3 +1418,123 @@ def test_input_projection_fusion_rejects_lora_without_changing_the_default_path(
         attention = _input_projection_attention()
         assert attention._ascend_fuse_input_projections is False
         assert "ascend_input_projection_weight" not in attention._buffers
+
+
+def _raw_gate_native_decode_case():
+    attention = _new_attention()
+    attention._conv_state_dim_first = False
+    attention.num_speculative_tokens = 0
+    rows, width, stride = 2, 4, 28
+    storage = torch.arange(rows * stride, dtype=torch.float32).bfloat16()
+    qkv = storage.as_strided((rows, 3 * width), (stride, 1))
+    gate = storage.as_strided((1, rows, 2, 2), (rows * stride, stride, 2, 1), 3 * width)
+    values = dict(
+        mixed_qkv=qkv,
+        conv_weights_t=torch.empty(4, 3 * width, dtype=torch.bfloat16),
+        conv_state_storage=torch.empty(8, 3, 3 * width, dtype=torch.bfloat16),
+        query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+        cache_indices=torch.arange(1, rows + 1, dtype=torch.int32),
+        initial_state_mode=None,
+        run_mode=1,
+        max_query_len=1,
+        gate_tensor=gate,
+        packed_gate=torch.empty_like(gate, memory_format=torch.contiguous_format),
+    )
+    return attention, values
+
+
+def test_native_decode_gate_pack_uses_zero_copy_2d_metadata_views_and_dense_gate():
+    attention, values = _raw_gate_native_decode_case()
+    source_gate, target_gate = values["gate_tensor"], values["packed_gate"]
+    source_before = values["mixed_qkv"].untyped_storage().clone()
+
+    def prepare(indices, starts, slots, null, output, **options):
+        assert slots == 8 and null == NULL_BLOCK_ID
+        assert indices is values["cache_indices"] and starts is values["query_start_loc"]
+        gate, packed = options["gate_tensor"], options["packed_gate"]
+        assert gate.shape == packed.shape == (2, 4)
+        assert gate.data_ptr() == source_gate.data_ptr()
+        assert gate.storage_offset() == source_gate.storage_offset()
+        assert gate.stride() == (28, 1)
+        assert packed.data_ptr() == target_gate.data_ptr() and packed.is_contiguous()
+        assert gate.untyped_storage().data_ptr() == options["input_tensor"].untyped_storage().data_ptr()
+        options["packed_input"].copy_(options["input_tensor"])
+        packed.copy_(gate)
+        return indices
+
+    def native(input_, state, _weights, **options):
+        assert input_.is_contiguous() and state is values["conv_state_storage"]
+        torch.testing.assert_close(target_gate, source_gate, rtol=0, atol=0)
+        options["out"].copy_(input_)
+        return options["out"]
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as prepared,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native) as update,
+    ):
+        actual = attention._run_causal_conv1d(**values)
+    assert prepared.call_count == update.call_count == 1
+    torch.testing.assert_close(actual, values["mixed_qkv"], rtol=0, atol=0)
+    assert list(values["mixed_qkv"].untyped_storage()) == list(source_before)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "state_dtype",
+        "index_dtype",
+        "starts_dtype",
+        "run_mode",
+        "max_query",
+        "accepted",
+        "spec",
+        "contiguous",
+        "gate_shape",
+        "state_alias",
+        "indices_alias",
+        "starts_alias",
+    ],
+)
+def test_native_decode_gate_pack_rejects_unsupported_cases_before_state_or_native_updates(invalid):
+    attention, values = _raw_gate_native_decode_case()
+    if invalid == "state_dtype":
+        values["conv_state_storage"] = values["conv_state_storage"].float()
+    elif invalid == "index_dtype":
+        values["cache_indices"] = values["cache_indices"].long()
+    elif invalid == "starts_dtype":
+        values["query_start_loc"] = values["query_start_loc"].long()
+    elif invalid == "run_mode":
+        values["run_mode"] = 0
+    elif invalid == "max_query":
+        values["max_query_len"] = 2
+    elif invalid == "accepted":
+        values["num_accepted_tokens"] = torch.ones(2, dtype=torch.int32)
+    elif invalid == "spec":
+        attention.num_speculative_tokens = 1
+    elif invalid == "contiguous":
+        values["mixed_qkv"] = values["mixed_qkv"].contiguous()
+    elif invalid == "gate_shape":
+        values["gate_tensor"] = values["gate_tensor"][0]
+    elif invalid == "state_alias":
+        values["packed_gate"] = values["conv_state_storage"].view(-1)[:8].view(1, 2, 2, 2)
+    else:
+        key = "cache_indices" if invalid == "indices_alias" else "query_start_loc"
+        backing = torch.empty(16, dtype=torch.int32)
+        original = values[key]
+        values[key] = backing[: original.numel()]
+        values[key].copy_(original)
+        values["packed_gate"] = backing.view(torch.bfloat16)[:8].view(1, 2, 2, 2)
+    state_before = values["conv_state_storage"].clone()
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode") as prepared,
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.copy_conv_state") as copy,
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.gather_update_conv_state") as gather,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update") as native,
+        pytest.raises(ValueError),
+    ):
+        attention._run_causal_conv1d(**values)
+    prepared.assert_not_called()
+    copy.assert_not_called()
+    gather.assert_not_called()
+    native.assert_not_called()
+    torch.testing.assert_close(values["conv_state_storage"], state_before, rtol=0, atol=0, equal_nan=True)
