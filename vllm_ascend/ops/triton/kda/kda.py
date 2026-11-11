@@ -224,6 +224,7 @@ def layer_norm_gated_fwd_kernel(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    G_TOKEN_STRIDE: tl.constexpr = 0,
 ):
     i_t = tl.program_id(0)
 
@@ -268,7 +269,8 @@ def layer_norm_gated_fwd_kernel(
     if PACKED_GATE:
         beta_width = H
         gate_width = H * D
-        packed_row_width = beta_width + gate_width + gate_width
+        # Zero retains the original Kimi BFG layout for existing callers.
+        packed_row_width = G_TOKEN_STRIDE if G_TOKEN_STRIDE else beta_width + gate_width + gate_width
         g_rows = (rows // H) * packed_row_width + (rows % H) * D
         g_offsets = g_rows[:, None] + o_d[None, :]
     elif STRIDED_GATE:
@@ -496,7 +498,8 @@ def rms_norm_gated(
             or (
                 g.stride(-1) == 1
                 and g.stride(-2) == x.shape[-1]
-                and g.stride(-3) == _packed_bfg_row_width(x.shape[-2], x.shape[-1])
+                # Heads/features are dense; distinct token rows do not overlap.
+                and g.stride(-3) >= x.shape[-2] * x.shape[-1]
             )
         )
     ):
@@ -514,6 +517,10 @@ def rms_norm_gated(
         rows = x.numel() // x.shape[-1]
         if rows:
             packed_gate = not g.is_contiguous()
+            gate_options = {}
+            if packed_gate and g.stride(-3) != _packed_bfg_row_width(x.shape[-2], x.shape[-1]):
+                # Kimi and contiguous gates keep their original kernel call.
+                gate_options["G_TOKEN_STRIDE"] = g.stride(-3)
             # Spread small decode batches over the vector cores, while keeping
             # the original per-program row count for chunked prefill.
             if rows <= _KIMI_NORM_SMALL_BATCH_MAX_ROWS:
@@ -548,6 +555,7 @@ def rms_norm_gated(
                 ACTIVATION=activation,
                 IS_RMS_NORM=True,
                 num_warps=4,
+                **gate_options,
             )
         return y
     if out is not None:
