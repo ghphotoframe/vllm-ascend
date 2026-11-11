@@ -37,12 +37,15 @@ def _zero_padded_spec_output(output: torch.Tensor, query_start_loc: torch.Tensor
     return torch.where(valid_tokens.view(1, -1, 1, 1), output, 0.0)
 
 
-def _contiguous_packed_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Reuse contiguous adjacent projection slices; otherwise retain cat.
+def _contiguous_packed_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, allow_row_gaps: bool = False
+) -> torch.Tensor:
+    """Reuse adjacent projection slices when permitted by the caller.
 
-    QKVB rows contain a beta tail. That tail prevents a contiguous packed
-    view for multiple rows, while a single decode row has no inter-row gap.
-    All checks are tensor metadata; no projection or storage is cached.
+    A projection may have columns after Q/K/V, creating row gaps. Only the
+    native fixed-decode prepare path may defer compaction of such a view;
+    native convolution itself still receives a dense buffer. A single row
+    is already contiguous. All checks use tensor metadata, without caching.
     """
     if (
         q.ndim == k.ndim == v.ndim == 2
@@ -62,9 +65,30 @@ def _contiguous_packed_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->
             and q.untyped_storage().data_ptr() == k.untyped_storage().data_ptr() == v.untyped_storage().data_ptr()
         ):
             packed = q.as_strided((q.shape[0], 3 * width), q.stride(), storage_offset=q.storage_offset())
-            if packed.is_contiguous():
+            if packed.is_contiguous() or (allow_row_gaps and q.stride(0) >= 3 * width):
                 return packed
     return torch.cat((q, k, v), dim=-1)
+
+
+def _native_decode_prepare_compatible(
+    num_tokens: int,
+    input_dtype: torch.dtype,
+    conv_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_speculative_tokens: int,
+) -> bool:
+    return (
+        native_conv_state_supported(conv_state, input_dtype)
+        and num_speculative_tokens == 0
+        and input_dtype == torch.bfloat16
+        and cache_indices.ndim in (1, 2)
+        and cache_indices.shape[0] == num_tokens
+        and (cache_indices.ndim == 1 or cache_indices.shape[1] > 0)
+        and cache_indices.dtype == torch.int32
+        and query_start_loc.dtype == torch.int32
+        and query_start_loc.shape == (num_tokens + 1,)
+    )
 
 
 @PluggableLayer.register_oot(name="BailingMoeV3KimiDeltaAttention")
@@ -274,22 +298,40 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
 
         conv_output = None
         fuse_native_decode_prepare = (
-            not copy_state_back
-            and run_mode == 1
+            run_mode == 1
             and max_query_len == 1
             and num_accepted_tokens is None
-            and self.num_speculative_tokens == 0
             and mixed_qkv.ndim == 2
-            and mixed_qkv.shape[0] == cache_indices.shape[0]
-            and mixed_qkv.dtype == torch.bfloat16
-            and cache_indices.dtype == torch.int32
-            and query_start_loc.dtype == torch.int32
+            and _native_decode_prepare_compatible(
+                mixed_qkv.shape[0],
+                mixed_qkv.dtype,
+                conv_state,
+                cache_indices,
+                query_start_loc,
+                self.num_speculative_tokens,
+            )
         )
         if fuse_native_decode_prepare:
-            conv_output = torch.empty_like(mixed_qkv)
-            kernel_indices = prepare_native_conv_decode(
-                cache_indices, query_start_loc, conv_state.shape[0], null_block_id, conv_output
-            )
+            if mixed_qkv.is_contiguous():
+                # CC1 and genuinely packed projections retain the original
+                # prepare kernel, with no projection copy.
+                conv_output = torch.empty_like(mixed_qkv)
+                kernel_indices = prepare_native_conv_decode(
+                    cache_indices, query_start_loc, conv_state.shape[0], null_block_id, conv_output
+                )
+            else:
+                packed_input = torch.empty(mixed_qkv.shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+                conv_output = torch.empty_like(packed_input)
+                kernel_indices = prepare_native_conv_decode(
+                    cache_indices,
+                    query_start_loc,
+                    conv_state.shape[0],
+                    null_block_id,
+                    conv_output,
+                    input_tensor=mixed_qkv,
+                    packed_input=packed_input,
+                )
+                mixed_qkv = packed_input
         elif not copy_state_back:
             # Native fixed-row decode does not check query lengths or cache
             # bounds. Keep the staging path's inactive-row semantics when
@@ -437,19 +479,38 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        conv_state, recurrent_state = self.kv_cache
+        spec_masks = attn_metadata.spec_sequence_masks
+        defer_qkv_pack = False
+        if (
+            spec_masks is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+            and q_proj_states.dtype == torch.bfloat16
+        ):
+            decode_meta = attn_metadata.non_spec_decode_metadata
+            if decode_meta is not None:
+                native_state = conv_state.transpose(-1, -2) if self._conv_state_dim_first else conv_state
+                defer_qkv_pack = _native_decode_prepare_compatible(
+                    num_actual_tokens,
+                    q_proj_states.dtype,
+                    native_state,
+                    decode_meta.causal_conv1d.cache_indices,
+                    decode_meta.causal_conv1d.query_start_loc,
+                    self.num_speculative_tokens,
+                )
         mixed_qkv = _contiguous_packed_qkv(
             q_proj_states[:num_actual_tokens],
             k_proj_states[:num_actual_tokens],
             v_proj_states[:num_actual_tokens],
+            allow_row_gaps=defer_qkv_pack,
         )
         # Keep the upstream custom-op keyword name (g1), while treating the
         # tensor as the raw gate required by the AscendC kernels.
         raw_gate = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
-        conv_state, recurrent_state = self.kv_cache
         conv_weights_t = self._conv_weights_t(mixed_qkv.dtype)
-        spec_masks = attn_metadata.spec_sequence_masks
         spec_token_indices = attn_metadata.spec_token_indx
         non_spec_token_indices = attn_metadata.non_spec_token_indx
 

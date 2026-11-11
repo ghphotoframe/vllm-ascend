@@ -26,6 +26,10 @@ def _prepare_native_conv_decode_kernel(
     DIM: tl.constexpr,
     NULL_SLOT: tl.constexpr,
     BLOCK: tl.constexpr,
+    INPUT=None,
+    PACKED_INPUT=None,
+    INPUT_ROW_STRIDE: tl.constexpr = 0,
+    PACK_INPUT: tl.constexpr = False,
 ):
     channel_tiles = tl.cdiv(DIM, BLOCK)
     for tile in range(tl.program_id(0), REQUESTS * channel_tiles, tl.num_programs(0)):
@@ -44,6 +48,11 @@ def _prepare_native_conv_decode_kernel(
             0,
             mask=(channels < DIM) & ~active,
         )
+        if PACK_INPUT:
+            # The same-size integer views preserve all BF16 payload bits.
+            source_column = tl.minimum(channels, DIM - 1)
+            payload = tl.load(INPUT + request * INPUT_ROW_STRIDE + source_column, channels < DIM, other=0)
+            tl.store(PACKED_INPUT + request * DIM + channels, payload, channels < DIM)
 
 
 def prepare_native_conv_decode(
@@ -52,6 +61,9 @@ def prepare_native_conv_decode(
     num_slots: int,
     null_block_id: int,
     output: torch.Tensor,
+    *,
+    input_tensor: torch.Tensor | None = None,
+    packed_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize fixed-row decode indices and clear skipped output rows.
 
@@ -77,10 +89,41 @@ def prepare_native_conv_decode(
         divisor == 0 or (requests > column_stride // divisor and output.shape[1] > row_stride // divisor)
     ):
         raise ValueError("output rows and channels must not overlap")
+    if (input_tensor is None) != (packed_input is None):
+        raise ValueError("Input compaction requires both source and destination")
+    if input_tensor is not None:
+        if (
+            input_tensor.shape != output.shape
+            or packed_input.shape != output.shape
+            or input_tensor.dtype != torch.bfloat16
+            or packed_input.dtype != torch.bfloat16
+            or input_tensor.device != output.device
+            or packed_input.device != output.device
+            or input_tensor.stride(1) != 1
+            or input_tensor.stride(0) < input_tensor.shape[1]
+            or not packed_input.is_contiguous()
+        ):
+            raise ValueError("Compaction requires same-shape/device BF16 inputs with contiguous channels/destination")
+        if requests > 0:
+            storage_pointers = {tensor.untyped_storage().data_ptr() for tensor in (input_tensor, packed_input, output)}
+            if len(storage_pointers) != 3:
+                # A program can clear output while another copies input;
+                # reject even disjoint views of one storage conservatively.
+                raise ValueError("Compaction source, destination, and output must use separate storage")
     normalized = torch.empty((requests,), dtype=cache_indices.dtype, device=cache_indices.device)
     if requests == 0:
         return normalized
     grid = (min(requests * triton.cdiv(output.shape[1], _CONV_STATE_COPY_BLOCK_SIZE), _CONV_STATE_COPY_MAX_PROGRAMS),)
+    copy_options = (
+        {}
+        if input_tensor is None
+        else {
+            "INPUT": input_tensor.view(torch.int16),
+            "PACKED_INPUT": packed_input.view(torch.int16),
+            "INPUT_ROW_STRIDE": input_tensor.stride(0),
+            "PACK_INPUT": True,
+        }
+    )
     _prepare_native_conv_decode_kernel[grid](
         cache_indices,
         query_start_loc,
@@ -95,6 +138,7 @@ def prepare_native_conv_decode(
         DIM=output.shape[1],
         NULL_SLOT=null_block_id,
         BLOCK=_CONV_STATE_COPY_BLOCK_SIZE,
+        **copy_options,
     )
     return normalized
 

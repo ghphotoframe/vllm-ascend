@@ -120,3 +120,104 @@ def test_native_decode_preparation_rejects_invalid_tensor_contracts(invalid):
     ):
         prepare_native_conv_decode(indices, starts, num_slots, 0, output)
     kernel.__getitem__.assert_not_called()
+
+
+def test_native_decode_preparation_public_wrapper_preserves_five_argument_default():
+    indices = torch.arange(2, dtype=torch.int32)
+    starts = torch.arange(3, dtype=torch.int32)
+    output = torch.empty(2, 5)
+    with patch("vllm_ascend.ops.triton.kda.conv_state.prepare_native_conv_decode") as inner:
+        result = prepare_native_conv_decode(indices, starts, 8, 0, output)
+    inner.assert_called_once_with(indices, starts, 8, 0, output)
+    assert result is inner.return_value
+
+
+@pytest.mark.parametrize("rows,gap", [(1, 4), (2, 4), (4, 1040)])
+def test_native_decode_preparation_optional_pack_passes_same_width_integer_views(rows, gap):
+    width = 1536
+    indices = torch.arange(2 * rows + 1, dtype=torch.int32)[1::2]
+    starts = torch.arange(2 * (rows + 1) + 1, dtype=torch.int32)[1::2]
+    backing = torch.empty(16 + rows * (width + gap), dtype=torch.bfloat16)
+    source = backing.as_strided((rows, width), (width + gap, 1), 16)
+    packed = torch.empty_like(source, memory_format=torch.contiguous_format)
+    output = torch.empty_like(packed)
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("preparation cannot read host data")),
+    ):
+        normalized = prepare_native_conv_decode(indices, starts, 8, 0, output, input_tensor=source, packed_input=packed)
+    launch = kernel.__getitem__.return_value
+    launch.assert_called_once()
+    options = launch.call_args.kwargs
+    assert options["PACK_INPUT"] is True
+    assert options["INPUT_ROW_STRIDE"] == width + gap
+    assert options["INPUT"].dtype == options["PACKED_INPUT"].dtype == torch.int16
+    assert options["INPUT"].stride() == source.stride()
+    assert options["INPUT"].storage_offset() == source.storage_offset()
+    assert options["INPUT"].untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+    assert options["PACKED_INPUT"].untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
+    assert normalized.dtype == torch.int32 and normalized.shape == (rows,)
+
+
+@pytest.mark.parametrize("alias", ["source_packed", "source_output", "packed_output"])
+def test_native_decode_preparation_compaction_rejects_shared_storage_even_for_disjoint_views(alias):
+    rows, width = 2, 12
+    indices = torch.arange(rows, dtype=torch.int32)
+    starts = torch.arange(rows + 1, dtype=torch.int32)
+    source = torch.empty(rows, width, dtype=torch.bfloat16)
+    packed = torch.empty_like(source)
+    output = torch.empty_like(source)
+    shared = torch.empty(2 * rows * width, dtype=torch.bfloat16)
+    first, second = shared[: rows * width].view(rows, width), shared[rows * width :].view(rows, width)
+    if alias == "source_packed":
+        source, packed = first, second
+    elif alias == "source_output":
+        source, output = first, second
+    else:
+        packed, output = first, second
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        pytest.raises(ValueError, match="separate storage"),
+    ):
+        prepare_native_conv_decode(indices, starts, 8, 0, output, input_tensor=source, packed_input=packed)
+    kernel.__getitem__.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invalid", ["source_only", "destination_only", "source_dtype", "shape", "column_stride", "destination_stride"]
+)
+def test_native_decode_preparation_compaction_rejects_invalid_contracts(invalid):
+    indices, starts = torch.arange(2, dtype=torch.int32), torch.arange(3, dtype=torch.int32)
+    output = torch.empty(2, 12, dtype=torch.bfloat16)
+    source, packed = torch.empty_like(output), torch.empty_like(output)
+    if invalid == "source_only":
+        packed = None
+    elif invalid == "destination_only":
+        source = None
+    elif invalid == "source_dtype":
+        source = source.float()
+    elif invalid == "shape":
+        source = source[:, :-1]
+    elif invalid == "column_stride":
+        source = torch.empty(2, 24, dtype=torch.bfloat16)[:, ::2]
+    else:
+        packed = torch.empty(2, 24, dtype=torch.bfloat16)[:, :12]
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        pytest.raises(ValueError),
+    ):
+        prepare_native_conv_decode(indices, starts, 8, 0, output, input_tensor=source, packed_input=packed)
+    kernel.__getitem__.assert_not_called()
+
+
+def test_native_decode_preparation_empty_compaction_never_launches_or_checks_storage():
+    indices = torch.empty(0, dtype=torch.int32)
+    starts = torch.zeros(1, dtype=torch.int32)
+    source, packed, output = (torch.empty(0, 12, dtype=torch.bfloat16) for _ in range(3))
+    with (
+        patch("vllm_ascend.ops.triton.kda.conv_state._prepare_native_conv_decode_kernel") as kernel,
+        patch.object(torch.UntypedStorage, "data_ptr", side_effect=AssertionError("empty requests do not race")),
+    ):
+        result = prepare_native_conv_decode(indices, starts, 0, 0, output, input_tensor=source, packed_input=packed)
+    assert result.shape == (0,)
+    kernel.__getitem__.assert_not_called()

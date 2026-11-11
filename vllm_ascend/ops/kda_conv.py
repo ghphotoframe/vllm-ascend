@@ -51,11 +51,24 @@ def prepare_native_conv_decode(
     num_slots: int,
     null_block_id: int,
     output: torch.Tensor,
+    *,
+    input_tensor: torch.Tensor | None = None,
+    packed_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Prepare safe indices and skipped output rows for native fixed decode."""
+    """Prepare native fixed decode, optionally compacting a row-gap input."""
     from vllm_ascend.ops.triton.kda.conv_state import prepare_native_conv_decode as prepare
 
-    return prepare(cache_indices, query_start_loc, num_slots, null_block_id, output)
+    if input_tensor is None and packed_input is None:
+        return prepare(cache_indices, query_start_loc, num_slots, null_block_id, output)
+    return prepare(
+        cache_indices,
+        query_start_loc,
+        num_slots,
+        null_block_id,
+        output,
+        input_tensor=input_tensor,
+        packed_input=packed_input,
+    )
 
 
 def run_causal_conv1d(

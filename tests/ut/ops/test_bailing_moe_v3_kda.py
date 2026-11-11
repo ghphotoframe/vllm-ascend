@@ -23,6 +23,7 @@ from vllm_ascend.ops import kda_state_copy_plan
 from vllm_ascend.ops.bailing_moe_v3_kda import (
     AscendBailingMoeV3KimiDeltaAttention,
     _contiguous_packed_qkv,
+    _native_decode_prepare_compatible,
     _zero_padded_spec_output,
 )
 
@@ -979,3 +980,92 @@ def test_mixed_spec_scatter_clears_unassigned_graph_rows(monkeypatch, flash_kda_
         flash_kda_enabled=flash_kda_enabled,
         extra_unassigned_tokens=1,
     )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+@pytest.mark.parametrize("width,gap", [(3, 7), (512, 4), (512, 1040)])
+def test_decode_qkv_compaction_can_defer_generic_adjacent_row_gaps(num_tokens, width, gap):
+    row_stride, offset = 3 * width + gap, 16
+    backing = torch.arange(offset + num_tokens * row_stride, dtype=torch.float32).to(torch.bfloat16)
+    projection = backing.as_strided((num_tokens, 3 * width), (row_stride, 1), offset)
+    q, k, v = projection.chunk(3, dim=-1)
+    expected = torch.cat((q, k, v), dim=-1)
+    original = backing.clone()
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", side_effect=AssertionError("defer safe row-gap cat")):
+        actual = _contiguous_packed_qkv(q, k, v, allow_row_gaps=True)
+    assert actual.stride() == projection.stride()
+    assert actual.storage_offset() == offset
+    assert actual.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    assert actual.is_contiguous() == (num_tokens == 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(backing, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["state_dtype", "input_dtype", "index_dtype", "starts_dtype", "rows", "starts_shape", "speculative"]
+)
+def test_decode_qkv_defer_guard_rejects_non_native_or_non_fixed_decode(invalid):
+    rows, input_dtype = 2, torch.bfloat16
+    state = torch.empty(8, 3, 12, dtype=torch.bfloat16)
+    indices, starts, speculative = torch.arange(rows, dtype=torch.int32), torch.arange(rows + 1, dtype=torch.int32), 0
+    assert _native_decode_prepare_compatible(rows, input_dtype, state, indices, starts, speculative)
+    if invalid == "state_dtype":
+        state = state.float()
+    elif invalid == "input_dtype":
+        input_dtype = torch.float16
+    elif invalid == "index_dtype":
+        indices = indices.long()
+    elif invalid == "starts_dtype":
+        starts = starts.long()
+    elif invalid == "rows":
+        rows += 1
+    elif invalid == "starts_shape":
+        starts = starts[:-1]
+    else:
+        speculative = 3
+    assert not _native_decode_prepare_compatible(rows, input_dtype, state, indices, starts, speculative)
+
+
+@pytest.mark.parametrize("num_tokens,gap", [(1, 4), (2, 4), (4, 1040)])
+def test_native_single_token_decode_folds_row_gap_pack_into_prepare(num_tokens, gap):
+    attention = _new_attention()
+    attention._conv_state_dim_first = False
+    attention.num_speculative_tokens = 0
+    dim = 12
+    storage = torch.randn(num_tokens, dim + gap, dtype=torch.bfloat16)
+    x = storage[:, :dim]
+    expected = x.clone()
+    state = torch.empty(8, 3, dim, dtype=x.dtype)
+    indices = torch.arange(1, num_tokens + 1, dtype=torch.int32)
+    starts = torch.arange(num_tokens + 1, dtype=torch.int32)
+
+    def prepare(cache_indices, query_start_loc, slots, null, out, **kwargs):
+        assert slots == state.shape[0] and null == NULL_BLOCK_ID
+        assert cache_indices is indices and query_start_loc is starts
+        if num_tokens == 1:
+            assert kwargs == {}
+        else:
+            assert kwargs["input_tensor"] is x
+            assert kwargs["packed_input"].is_contiguous()
+            kwargs["packed_input"].copy_(x)
+        return indices
+
+    def native(input_, cache, _weight, **kwargs):
+        assert cache is state
+        assert input_.is_contiguous()
+        assert (input_ is x) == (num_tokens == 1)
+        torch.testing.assert_close(input_, expected, rtol=0, atol=0)
+        out = kwargs["out"]
+        assert out.is_contiguous()
+        out.copy_(input_)
+        return out
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as prepared,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native) as update,
+    ):
+        actual = attention._run_causal_conv1d(
+            x, torch.empty(4, dim, dtype=x.dtype), state, starts, indices, None, run_mode=1, max_query_len=1
+        )
+    assert prepared.call_count == update.call_count == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
