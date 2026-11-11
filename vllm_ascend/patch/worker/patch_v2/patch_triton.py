@@ -29,7 +29,11 @@ from vllm_ascend.ops.triton.v2.sample.thinking_budget import (
     _load_effective_token_ascend,
     _update_committed_marker_cache_kernel_ascend,
 )
-from vllm_ascend.worker.v2.sample.apply_top_k_top_p import apply_top_k_top_p_npu
+from vllm_ascend.worker.v2.sample.apply_top_k_top_p import (
+    apply_top_k_top_p_npu,
+    apply_top_k_top_p_with_cpu_metadata,
+    wrap_sample_random_with_cpu_metadata,
+)
 from vllm_ascend.worker.v2.sample.bad_words import apply_bad_words
 from vllm_ascend.worker.v2.sample.gumbel import apply_temperature
 from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs, compute_topk_logprobs
@@ -61,6 +65,9 @@ base_speculator.gumbel_sample = categorical_sample
 dspark_speculator.gumbel_sample = categorical_sample
 sampler.gumbel_sample = categorical_sample
 topk_topp_sampler.apply_top_k_top_p_triton = apply_top_k_top_p_npu
+states.SamplingStates.apply_top_k_top_p = apply_top_k_top_p_with_cpu_metadata
+# Ordinary V2 sampling filters inside _sample_random, bypassing the states method.
+sampler.Sampler._sample_random = wrap_sample_random_with_cpu_metadata(sampler.Sampler._sample_random)
 structured_outputs._apply_grammar_bitmask_kernel = _apply_grammar_bitmask_kernel
 mamba_utils.precopy_mamba_align_fused_kernel = precopy_mamba_align_fused_kernel
 # This patch may be revisited or reverted once the compiler and Triton Ascend toolkit
