@@ -4,6 +4,7 @@
 
 import torch
 from einops import rearrange
+from torch._subclasses.fake_tensor import FakeTensor
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
@@ -29,6 +30,36 @@ def _zero_padded_spec_output(output: torch.Tensor, query_start_loc: torch.Tensor
     token_indices = torch.arange(output.shape[1], dtype=query_start_loc.dtype, device=output.device)
     valid_tokens = token_indices < query_start_loc[-1]
     return torch.where(valid_tokens.view(1, -1, 1, 1), output, 0.0)
+
+
+def _contiguous_packed_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Reuse contiguous adjacent projection slices; otherwise retain cat.
+
+    QKVB rows contain a beta tail. That tail prevents a contiguous packed
+    view for multiple rows, while a single decode row has no inter-row gap.
+    All checks are tensor metadata; no projection or storage is cached.
+    """
+    if (
+        q.ndim == k.ndim == v.ndim == 2
+        and q.shape == k.shape == v.shape
+        and q.shape[0] > 0
+        and q.dtype == k.dtype == v.dtype
+        and q.device == k.device == v.device
+        and not q.is_meta
+        and not any(isinstance(tensor, FakeTensor) for tensor in (q, k, v))
+        and q.stride() == k.stride() == v.stride()
+        and q.stride(-1) == 1
+    ):
+        width = q.shape[1]
+        if (
+            k.storage_offset() == q.storage_offset() + width
+            and v.storage_offset() == q.storage_offset() + 2 * width
+            and q.untyped_storage().data_ptr() == k.untyped_storage().data_ptr() == v.untyped_storage().data_ptr()
+        ):
+            packed = q.as_strided((q.shape[0], 3 * width), q.stride(), storage_offset=q.storage_offset())
+            if packed.is_contiguous():
+                return packed
+    return torch.cat((q, k, v), dim=-1)
 
 
 @PluggableLayer.register_oot(name="BailingMoeV3KimiDeltaAttention")
@@ -105,13 +136,14 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             d=self.head_dim,
         )
 
-        core_attn_out = torch.zeros(
+        core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
         torch.ops.vllm.bailing_v3_kda_attention(q, k, v, raw_gate, beta, core_attn_out, self.prefix)
-        core_attn_out = self.o_norm(core_attn_out, output_gate)
+        # Match Kimi's registered norm path while retaining its parameters.
+        self.o_norm.forward_oot(core_attn_out, output_gate, out=core_attn_out)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
 
@@ -380,13 +412,10 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
-        mixed_qkv = torch.cat(
-            (
-                q_proj_states[:num_actual_tokens],
-                k_proj_states[:num_actual_tokens],
-                v_proj_states[:num_actual_tokens],
-            ),
-            dim=-1,
+        mixed_qkv = _contiguous_packed_qkv(
+            q_proj_states[:num_actual_tokens],
+            k_proj_states[:num_actual_tokens],
+            v_proj_states[:num_actual_tokens],
         )
         # Keep the upstream custom-op keyword name (g1), while treating the
         # tensor as the raw gate required by the AscendC kernels.
@@ -549,8 +578,9 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             core_attn_out.zero_()
             return
 
-        core_attn_out[:, :num_actual_tokens].zero_()
         if core_spec is not None and core_non_spec is not None:
+            # The two indexed writes can leave holes in graph-shaped metadata.
+            core_attn_out[:, :num_actual_tokens].zero_()
             assert spec_token_indices is not None and non_spec_token_indices is not None
             core_attn_out[:, :num_actual_tokens].index_copy_(1, spec_token_indices, core_spec)
             core_attn_out[:, :num_actual_tokens].index_copy_(1, non_spec_token_indices, core_non_spec)

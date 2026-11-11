@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from vllm.model_executor.models.bailing_moe_v3 import (
     BailingMoeV3KimiDeltaAttention,
     bailing_v3_kda_attention,
@@ -21,6 +22,7 @@ from tests.ut.ops.test_gdn_attn_builder import (
 from vllm_ascend.ops import kda_state_copy_plan
 from vllm_ascend.ops.bailing_moe_v3_kda import (
     AscendBailingMoeV3KimiDeltaAttention,
+    _contiguous_packed_qkv,
     _zero_padded_spec_output,
 )
 
@@ -38,10 +40,12 @@ class _RecordingNorm(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.inputs: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.out: torch.Tensor | None = None
 
-    def forward(self, value: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward_oot(self, value: torch.Tensor, gate: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
         self.inputs = (value, gate)
-        return value
+        self.out = out
+        return value if out is None else out
 
 
 def _new_attention() -> AscendBailingMoeV3KimiDeltaAttention:
@@ -49,6 +53,109 @@ def _new_attention() -> AscendBailingMoeV3KimiDeltaAttention:
     nn.Module.__init__(attention)
     attention._ascend_kda_state_copy = None
     return attention
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_tokens", [1, 4])
+@pytest.mark.parametrize("beta_width", [0, 2], ids=["qkv", "qkvb"])
+def test_packed_qkv_reuses_only_contiguous_projection_storage(dtype, num_tokens, beta_width):
+    width = 3
+    projection = torch.arange(num_tokens * (3 * width + beta_width), dtype=dtype).reshape(num_tokens, -1)
+    q, k, v, _beta = projection.split([width, width, width, beta_width], dim=-1)
+    original = projection.clone()
+    expected = torch.cat((q, k, v), dim=-1)
+    can_alias = num_tokens == 1 or beta_width == 0
+
+    if can_alias:
+        with patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.torch.cat",
+            side_effect=AssertionError("adjacent contiguous slices must not be copied"),
+        ):
+            actual = _contiguous_packed_qkv(q, k, v)
+        assert actual.untyped_storage().data_ptr() == projection.untyped_storage().data_ptr()
+        assert actual.storage_offset() == q.storage_offset()
+    else:
+        with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", wraps=torch.cat) as cat:
+            actual = _contiguous_packed_qkv(q, k, v)
+        cat.assert_called_once()
+        assert actual.untyped_storage().data_ptr() != projection.untyped_storage().data_ptr()
+
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(projection, original, rtol=0, atol=0)
+
+
+def test_packed_qkv_preserves_nonzero_storage_offset():
+    projection = torch.arange(30, dtype=torch.float32).reshape(2, 15)
+    q, k, v = projection[1:2, 2:11].split(3, dim=-1)
+    expected = torch.cat((q, k, v), dim=-1)
+
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.torch.cat",
+        side_effect=AssertionError("the single QKV row is contiguous at its original offset"),
+    ):
+        actual = _contiguous_packed_qkv(q, k, v)
+
+    assert actual.untyped_storage().data_ptr() == projection.untyped_storage().data_ptr()
+    assert actual.storage_offset() == 17
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["separate_storage", "non_adjacent", "strided_columns", "different_dtype"])
+def test_packed_qkv_falls_back_for_unproven_layouts(layout):
+    projection = torch.arange(72, dtype=torch.float32).reshape(2, 36)
+    if layout == "separate_storage":
+        q, k, v = (projection[:, start : start + 3].clone() for start in (0, 3, 6))
+    elif layout == "non_adjacent":
+        q, k, v = (projection[:, start : start + 3] for start in (0, 4, 8))
+    elif layout == "strided_columns":
+        q, k, v = (projection[:, start : start + 6 : 2] for start in (0, 6, 12))
+    else:
+        q, k, v = projection[:, :9].split(3, dim=-1)
+        k = k.to(torch.bfloat16)
+    expected = torch.cat((q, k, v), dim=-1)
+
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", wraps=torch.cat) as cat:
+        actual = _contiguous_packed_qkv(q, k, v)
+
+    cat.assert_called_once()
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_packed_qkv_accepts_empty_graph_token_slices():
+    projection = torch.empty(0, 11)
+    q, k, v, _beta = projection.split([3, 3, 3, 2], dim=-1)
+
+    actual = _contiguous_packed_qkv(q, k, v)
+
+    assert actual.shape == (0, 9)
+    assert actual.dtype == projection.dtype
+    assert actual.is_contiguous()
+
+
+@pytest.mark.parametrize("shared_projection", [False, True], ids=["independent", "packed"])
+def test_packed_qkv_fake_tensors_use_cat_without_storage_pointer_access(shared_projection):
+    with FakeTensorMode():
+        if shared_projection:
+            q, k, v = torch.empty(1, 9, device="cpu").split(3, dim=-1)
+        else:
+            q, k, v = (torch.empty(1, 3, device="cpu") for _ in range(3))
+        with (
+            patch.object(
+                torch.UntypedStorage,
+                "data_ptr",
+                side_effect=AssertionError("FakeTensor storage pointers cannot establish aliasing"),
+            ),
+            patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", wraps=torch.cat) as cat,
+        ):
+            actual = _contiguous_packed_qkv(q, k, v)
+
+    cat.assert_called_once()
+    assert isinstance(actual, FakeTensor)
+    assert actual.shape == (1, 9)
+    assert actual.device == torch.device("cpu")
+    assert actual.dtype == q.dtype
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [0, 1, 7, 8])
@@ -138,6 +245,10 @@ def test_forward_passes_raw_gate_and_backend_beta(separate_b_proj: bool, flash_k
     with (
         patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
         patch.object(torch.ops.vllm, "bailing_v3_kda_attention", create=True) as custom_op,
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.torch.zeros",
+            side_effect=AssertionError("attention result is fully defined by the custom op"),
+        ),
     ):
         result = attention.forward(hidden_states, torch.arange(num_tokens), output)
 
@@ -154,6 +265,8 @@ def test_forward_passes_raw_gate_and_backend_beta(separate_b_proj: bool, flash_k
     assert tuple(core_arg.shape) == (1, num_tokens, num_heads, head_dim)
     assert prefix_arg == attention.prefix
     assert attention.o_norm.inputs is not None
+    assert attention.o_norm.inputs[0] is core_arg
+    assert attention.o_norm.out is core_arg
     torch.testing.assert_close(attention.o_norm.inputs[1], output_gate.reshape(num_tokens, num_heads, head_dim))
 
 
@@ -624,6 +737,47 @@ def test_profile_clears_preallocated_output(metadata):
     assert torch.equal(core_attn_out, torch.zeros_like(core_attn_out))
 
 
+def test_idle_metadata_clears_entire_uninitialized_output(monkeypatch):
+    _patch_missing_runtime_cdiv(monkeypatch)
+    _, _, metadata = _build_attn_metadata(
+        BatchSpec(seq_lens=[10], query_lens=[1]),
+        num_speculative_tokens=0,
+        num_decode_draft_tokens_cpu=None,
+    )
+    metadata.num_actual_tokens = 0
+    metadata.num_prefills = 0
+    metadata.num_decodes = 0
+    attention = SimpleNamespace(
+        prefix="model.layers.0.linear_attn",
+        head_dim=2,
+        kv_cache=(torch.empty(1), torch.empty(1)),
+        _conv_weights_t=MagicMock(return_value=torch.empty(1)),
+        _run_causal_conv1d=MagicMock(),
+        _run_recurrent=MagicMock(),
+        _run_prefill=MagicMock(),
+    )
+    core_attn_out = torch.full((1, 3, 1, 2), torch.nan)
+
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.get_forward_context",
+        return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+    ):
+        AscendBailingMoeV3KimiDeltaAttention._forward(
+            attention,
+            torch.empty(3, 2),
+            torch.empty(3, 2),
+            torch.empty(3, 2),
+            torch.empty(1, 3, 1, 2),
+            torch.empty(1, 3, 1),
+            core_attn_out,
+        )
+
+    assert torch.equal(core_attn_out, torch.zeros_like(core_attn_out))
+    attention._run_causal_conv1d.assert_not_called()
+    attention._run_recurrent.assert_not_called()
+    attention._run_prefill.assert_not_called()
+
+
 def test_spec_padding_discards_unwritten_nan_output():
     output = torch.full((1, 6, 1, 2), torch.nan)
     output[:, :4] = 3
@@ -643,7 +797,10 @@ def test_spec_padding_discards_unwritten_nan_output():
         pytest.param([10, 7, 20], [3, 4, 1], [2, -1, -1], id="spec-prefill-decode"),
     ],
 )
-def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_lens, query_lens, draft_tokens):
+@pytest.mark.parametrize("flash_kda_enabled", [False, True])
+def test_forward_routes_real_builder_metadata_and_clears_tail(
+    monkeypatch, seq_lens, query_lens, draft_tokens, flash_kda_enabled, extra_unassigned_tokens=0
+):
     _patch_missing_runtime_cdiv(monkeypatch)
     num_speculative_tokens = 2 if draft_tokens is not None else 0
     _, _, metadata = _build_attn_metadata(
@@ -651,14 +808,16 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_l
         num_speculative_tokens=num_speculative_tokens,
         num_decode_draft_tokens_cpu=None if draft_tokens is None else torch.tensor(draft_tokens, dtype=torch.int32),
     )
-    num_actual_tokens = sum(query_lens)
+    num_actual_tokens = sum(query_lens) + extra_unassigned_tokens
+    metadata.num_actual_tokens = num_actual_tokens
     num_allocated_tokens = num_actual_tokens + 2
     head_dim = 2
     q = torch.arange(num_allocated_tokens * head_dim, dtype=torch.float32).reshape(-1, head_dim)
     k = q + 100
     v = q + 200
     raw_gate = torch.zeros(1, num_allocated_tokens, 1, head_dim)
-    beta = torch.full((1, num_allocated_tokens, 1), 0.5)
+    beta_logits = torch.linspace(-8, 8, num_allocated_tokens, dtype=torch.bfloat16).reshape(1, -1, 1)
+    beta = beta_logits if flash_kda_enabled else beta_logits.float().sigmoid()
 
     def conv_forward(mixed, _weight, _state, starts, *_args, **_kwargs):
         assert starts[-1] == mixed.shape[0]
@@ -689,9 +848,12 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_l
     )
     core_attn_out = torch.full((1, num_allocated_tokens, 1, head_dim), torch.nan)
 
-    with patch(
-        "vllm_ascend.ops.bailing_moe_v3_kda.get_forward_context",
-        return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+    with (
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.get_forward_context",
+            return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+        ),
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
     ):
         AscendBailingMoeV3KimiDeltaAttention._forward(
             attention,
@@ -724,8 +886,41 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_l
     assert recurrent.call_count == (metadata.num_decodes > 0 or metadata.spec_sequence_masks is not None)
     assert conv.call_count == (2 if metadata.num_prefills and metadata.spec_sequence_masks is not None else 1)
 
+    expected_beta = beta[:, :num_actual_tokens]
+    if recurrent.called:
+        if metadata.spec_sequence_masks is not None:
+            recurrent_beta = (
+                expected_beta
+                if metadata.num_prefills == 0 and metadata.num_decodes == 0
+                else expected_beta.index_select(1, metadata.spec_token_indx)
+            )
+        else:
+            recurrent_beta = expected_beta[:, : metadata.num_decode_tokens]
+        torch.testing.assert_close(recurrent.call_args.args[4], recurrent_beta, rtol=0, atol=0)
+    if prefill.called:
+        prefill_beta = (
+            expected_beta.index_select(1, metadata.non_spec_token_indx)
+            if metadata.spec_sequence_masks is not None
+            else expected_beta[:, metadata.num_decode_tokens :]
+        )
+        torch.testing.assert_close(prefill.call_args.args[4], prefill_beta, rtol=0, atol=0)
+
     torch.testing.assert_close(core_attn_out, expected)
     torch.testing.assert_close(
         core_attn_out[:, num_actual_tokens:],
         torch.zeros_like(core_attn_out[:, num_actual_tokens:]),
+    )
+
+
+@pytest.mark.parametrize("flash_kda_enabled", [False, True])
+def test_mixed_spec_scatter_clears_unassigned_graph_rows(monkeypatch, flash_kda_enabled):
+    # Neither index_copy writes the extra actual-token row. It must be zeroed
+    # before scattering, even though complete single-path copies need no fill.
+    test_forward_routes_real_builder_metadata_and_clears_tail(
+        monkeypatch,
+        seq_lens=[10, 7, 20],
+        query_lens=[3, 4, 1],
+        draft_tokens=[2, -1, -1],
+        flash_kda_enabled=flash_kda_enabled,
+        extra_unassigned_tokens=1,
     )
