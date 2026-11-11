@@ -3,11 +3,14 @@
 """Ascend backend for the Bailing/Ling V3 Kimi Delta Attention layer."""
 
 import torch
+import torch_npu
 from einops import rearrange
 from torch._subclasses.fake_tensor import FakeTensor
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3KimiDeltaAttention
 from vllm.v1.attention.backend import AttentionBackend
@@ -25,9 +28,22 @@ from vllm_ascend.ops.kda_conv import (
 )
 from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state, gather_update_conv_state
+from vllm_ascend.utils import maybe_trans_nz
 
 _KDA_MAX_RECURRENT_TOKENS = 8
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+_PACKED_INPUT_PROJECTION_NAME = "ascend_input_projection_weight"
+_KDA_INPUT_PROJECTION_ALIGNMENT = 16
+_KDA_INPUT_PROJECTION_MAX_TOKENS = 4
+_KDA_ND_WEIGHT_FORMAT = 2
+
+
+def _input_projection_weight_format(weight: torch.Tensor) -> int | None:
+    return int(torch_npu.get_npu_format(weight)) if weight.device.type == "npu" else None
+
+
+def _input_projection_weight_nd(weight: torch.Tensor) -> torch.Tensor:
+    return torch_npu.npu_format_cast(weight, _KDA_ND_WEIGHT_FORMAT) if weight.device.type == "npu" else weight
 
 
 def _zero_padded_spec_output(output: torch.Tensor, query_start_loc: torch.Tensor) -> torch.Tensor:
@@ -123,6 +139,19 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         )
         self._ascend_conv_weights_ready = False
         self._ascend_conv_weights_initialized = False
+        config = kwargs.get("config", args[0] if args else None)
+        fuse_inputs = getattr(config, "fuse_kda_input_projections", False)
+        if type(fuse_inputs) is not bool:
+            raise ValueError("fuse_kda_input_projections must be a boolean")
+        self._ascend_fuse_input_projections = fuse_inputs
+        if fuse_inputs:
+            self._validate_input_projection_fusion()
+            # Keep canonical qkvb/f/g checkpoint parameters. The opt-in copy
+            # costs about 440 MiB/rank for the TP8 Ling-3.0 35-layer checkpoint.
+            self.register_buffer(_PACKED_INPUT_PROJECTION_NAME, None, persistent=False)
+            self._ascend_input_projection_ready = False
+            self._ascend_input_projection_initialized = False
+            self._ascend_input_projection_spec = None
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendFlashKDAAttentionBackend if FLASH_KDA_ENABLED else AscendGDNAttentionBackend
@@ -135,36 +164,45 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
     ) -> None:
         del positions
         num_tokens = hidden_states.size(0)
-        if self.separate_b_proj:
-            assert self.qkv_proj is not None and self.b_proj is not None
-            qkv = self.qkv_proj(hidden_states)[0]
+        if (
+            getattr(self, "_ascend_fuse_input_projections", False)
+            and 0 < num_tokens <= _KDA_INPUT_PROJECTION_MAX_TOKENS
+        ):
+            qkv, f_values, g_values, beta_logits = self._run_fused_input_projection(hidden_states)
             q, k, v = qkv.split(self.projection_size_per_partition, dim=-1)
-            beta_logits = self.b_proj(hidden_states)[0]
+            beta = (beta_logits if FLASH_KDA_ENABLED else beta_logits.float().sigmoid()).unsqueeze(0)
+            raw_gate = rearrange(f_values, "n (h d) -> 1 n h d", d=self.head_dim)
+            output_gate = rearrange(g_values, "n (h d) -> n h d", d=self.head_dim)
         else:
-            assert self.qkvb_proj is not None
-            qkvb = self.qkvb_proj(hidden_states)[0]
-            q, k, v, beta_logits = qkvb.split(
-                [
-                    self.projection_size_per_partition,
-                    self.projection_size_per_partition,
-                    self.projection_size_per_partition,
-                    self.local_num_heads,
-                ],
-                dim=-1,
+            if self.separate_b_proj:
+                assert self.qkv_proj is not None and self.b_proj is not None
+                qkv = self.qkv_proj(hidden_states)[0]
+                q, k, v = qkv.split(self.projection_size_per_partition, dim=-1)
+                beta_logits = self.b_proj(hidden_states)[0]
+            else:
+                assert self.qkvb_proj is not None
+                qkvb = self.qkvb_proj(hidden_states)[0]
+                q, k, v, beta_logits = qkvb.split(
+                    [
+                        self.projection_size_per_partition,
+                        self.projection_size_per_partition,
+                        self.projection_size_per_partition,
+                        self.local_num_heads,
+                    ],
+                    dim=-1,
+                )
+
+            # FlashKDA fuses sigmoid and must receive the original BF16 logits.
+            # Never reconstruct them with logit(sigmoid(beta)), which loses tails.
+            beta = (beta_logits if FLASH_KDA_ENABLED else beta_logits.float().sigmoid()).unsqueeze(0)
+            # AscendC performs the A_log/dt_bias gate conversion in-kernel. Passing
+            # vLLM's CUDA-preprocessed gate here would apply that conversion twice.
+            raw_gate = rearrange(self.f_proj(hidden_states)[0], "n (h d) -> 1 n h d", d=self.head_dim)
+            output_gate = rearrange(
+                self.g_proj(hidden_states)[0],
+                "n (h d) -> n h d",
+                d=self.head_dim,
             )
-
-        # FlashKDA fuses sigmoid and must receive the original BF16 logits.
-        # Never reconstruct them with logit(sigmoid(beta)), which loses tails.
-        beta = (beta_logits if FLASH_KDA_ENABLED else beta_logits.float().sigmoid()).unsqueeze(0)
-        # AscendC performs the A_log/dt_bias gate conversion in-kernel. Passing
-        # vLLM's CUDA-preprocessed gate here would apply that conversion twice.
-        raw_gate = rearrange(self.f_proj(hidden_states)[0], "n (h d) -> 1 n h d", d=self.head_dim)
-        output_gate = rearrange(
-            self.g_proj(hidden_states)[0],
-            "n (h d) -> n h d",
-            d=self.head_dim,
-        )
-
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
@@ -182,6 +220,8 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         # convs. During RL reload it also restores this parent's original
         # storage before packing, regardless of the checkpoint loading order.
         self._ascend_conv_weights_ready = False
+        if getattr(self, "_ascend_fuse_input_projections", False):
+            self._ascend_input_projection_ready = False
         parent_postload = getattr(super(), "process_weights_after_loading", None)
         if parent_postload is not None:
             parent_postload(act_dtype)
@@ -206,6 +246,113 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         packed.copy_(packed_weight)
         self._ascend_conv_weights_initialized = True
         self._ascend_conv_weights_ready = True
+        if getattr(self, "_ascend_fuse_input_projections", False):
+            self._pack_input_projection_weights()
+
+    def _validate_input_projection_fusion(self) -> None:
+        vllm_config = get_current_vllm_config_or_none()
+        if getattr(vllm_config, "lora_config", None) is not None:
+            # The merged public GEMM cannot apply LoRA wrapper updates.
+            raise ValueError("Fused KDA input projections do not support LoRA")
+        transfer_config = getattr(vllm_config, "weight_transfer_config", None)
+        if getattr(transfer_config, "backend", None) == "sparse_nccl":
+            # Sparse updates patch canonical parameters in place without the
+            # deferred post-load hook that must refresh this derived buffer.
+            raise ValueError("Fused KDA input projections do not support sparse_nccl weight updates")
+        if self.num_speculative_tokens or self.separate_b_proj:
+            raise ValueError("Fused KDA input projections require no MTP and a combined QKVB projection")
+        if self.projection_size_per_partition % _KDA_INPUT_PROJECTION_ALIGNMENT:
+            raise ValueError("Fused KDA input projections require a 16-aligned local projection width")
+        if getattr(self.model_config, "dtype", torch.bfloat16) != torch.bfloat16:
+            raise ValueError("Fused KDA input projections require a BF16 model dtype")
+        layers = (self.qkvb_proj, self.f_proj, self.g_proj)
+        for layer in layers:
+            if (
+                layer is None
+                or not isinstance(layer.quant_method, UnquantizedLinearMethod)
+                or layer.weight.dtype != torch.bfloat16
+                or getattr(layer, "bias", None) is not None
+                or getattr(layer, "gather_output", False)
+                or getattr(layer, "custom_op", None) is not None
+            ):
+                raise ValueError("Fused KDA input projections require local bias-free BF16 unquantized linears")
+
+    @torch.no_grad()
+    def _pack_input_projection_weights(self) -> None:
+        self._ascend_input_projection_ready = False
+        self._validate_input_projection_fusion()
+        projection = self.projection_size_per_partition
+        heads = self.local_num_heads
+        canonical = (self.qkvb_proj.weight, self.f_proj.weight, self.g_proj.weight)
+        expected_shapes = (
+            (3 * projection + heads, self.hidden_size),
+            (projection, self.hidden_size),
+            (projection, self.hidden_size),
+        )
+        if any(weight.is_meta or tuple(weight.shape) != shape for weight, shape in zip(canonical, expected_shapes)):
+            raise RuntimeError("Fused KDA projection weights must be materialized with their original shapes")
+        if any(weight.device != canonical[0].device for weight in canonical):
+            raise RuntimeError("Fused KDA projection weights must share one device")
+        qkvb, f_weight, g_weight = (_input_projection_weight_nd(weight) for weight in canonical)
+        padding = (-(5 * projection + heads)) % _KDA_INPUT_PROJECTION_ALIGNMENT
+        # Put beta after the wider gates so QKV/F/G/beta each start on a
+        # 32-byte boundary. No checkpoint values or activation order change.
+        packed = torch.cat(
+            (
+                qkvb[: 3 * projection],
+                f_weight,
+                g_weight,
+                qkvb[3 * projection :],
+                qkvb.new_zeros((padding, self.hidden_size)),
+            ),
+            dim=0,
+        )
+        if packed.device.type == "npu":
+            packed = maybe_trans_nz(packed)
+        spec = (
+            tuple(packed.shape),
+            packed.device,
+            packed.dtype,
+            _input_projection_weight_format(packed),
+        )
+        previous = self.get_buffer(_PACKED_INPUT_PROJECTION_NAME)
+        if not self._ascend_input_projection_initialized:
+            # Deferred post-load runs on the canonical parameters' real device.
+            self.register_buffer(_PACKED_INPUT_PROJECTION_NAME, packed, persistent=False)
+            self._ascend_input_projection_spec = spec
+            self._ascend_input_projection_initialized = True
+        else:
+            previous_spec = (
+                None
+                if previous is None
+                else (
+                    tuple(previous.shape),
+                    previous.device,
+                    previous.dtype,
+                    _input_projection_weight_format(previous),
+                )
+            )
+            if previous_spec != self._ascend_input_projection_spec or spec != self._ascend_input_projection_spec:
+                raise RuntimeError(
+                    "Fused KDA projection shape, dtype, device and format cannot change after initialization"
+                )
+            previous.copy_(packed)
+        self._ascend_input_projection_ready = True
+
+    def _run_fused_input_projection(self, hidden_states: torch.Tensor):
+        if not self._ascend_input_projection_ready:
+            raise RuntimeError("Fused KDA projection weights require deferred post-load/refit processing")
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError("Fused KDA input projections require BF16 hidden states")
+        projection = self.projection_size_per_partition
+        heads = self.local_num_heads
+        padding = (-(5 * projection + heads)) % _KDA_INPUT_PROJECTION_ALIGNMENT
+        packed = self.get_buffer(_PACKED_INPUT_PROJECTION_NAME)
+        projected = torch.ops.vllm.unquantized_gemm(hidden_states, packed, None)
+        qkv, f_values, g_values, beta, _padding = projected.split(
+            (3 * projection, projection, projection, heads, padding), dim=-1
+        )
+        return qkv, f_values, g_values, beta
 
     def _conv_weights_t(self, dtype: torch.dtype) -> torch.Tensor:
         packed = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)

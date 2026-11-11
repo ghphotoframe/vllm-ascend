@@ -8,6 +8,10 @@ import pytest
 import torch
 from torch import nn
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.model_loader.reload.layerwise import _finalize_attention_layer
+from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+from vllm.model_executor.model_loader.reload.utils import get_layer_params_buffers
 from vllm.model_executor.models.bailing_moe_v3 import (
     BailingMoeV3KimiDeltaAttention,
     bailing_v3_kda_attention,
@@ -1069,3 +1073,348 @@ def test_native_single_token_decode_folds_row_gap_pack_into_prepare(num_tokens, 
         )
     assert prepared.call_count == update.call_count == 1
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class _InputProjectionLinear(nn.Module):
+    def __init__(self, weight):
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.quant_method = UnquantizedLinearMethod()
+        self.bias = None
+        self.gather_output = False
+        self.custom_op = None
+
+    def forward(self, hidden):
+        return torch.nn.functional.linear(hidden, self.weight), None
+
+
+def _input_projection_attention(
+    *,
+    enabled=None,
+    num_speculative_tokens=0,
+    separate_b_proj=False,
+    dtype=torch.bfloat16,
+):
+    projection, heads, hidden = 16, 2, 8
+
+    def fake_base_init(instance, *_args, **_kwargs):
+        nn.Module.__init__(instance)
+        instance.num_speculative_tokens = num_speculative_tokens
+        instance.separate_b_proj = separate_b_proj
+        instance.hidden_size = hidden
+        instance.head_dim = projection // heads
+        instance.local_num_heads = heads
+        instance.projection_size_per_partition = projection
+        instance.model_config = SimpleNamespace(dtype=dtype)
+        instance.prefix = "model.layers.0.linear_attn"
+        instance.conv_size = 4
+        instance.q_conv1d, instance.k_conv1d, instance.v_conv1d = (
+            nn.Module(),
+            nn.Module(),
+            nn.Module(),
+        )
+        for conv in (instance.q_conv1d, instance.k_conv1d, instance.v_conv1d):
+            conv.weight = nn.Parameter(torch.ones(projection, 1, 4), requires_grad=False)
+        qkvb = torch.cat(
+            [torch.full((projection, hidden), value, dtype=dtype) for value in (1.0, 2.0, 3.0)]
+            + [torch.full((heads, hidden), 4.0, dtype=dtype)],
+            dim=0,
+        )
+        instance.qkvb_proj = _InputProjectionLinear(qkvb)
+        instance.f_proj = _InputProjectionLinear(torch.full((projection, hidden), 5.0, dtype=dtype))
+        instance.g_proj = _InputProjectionLinear(torch.full((projection, hidden), 6.0, dtype=dtype))
+        instance.o_proj = _InputProjectionLinear(torch.ones(hidden, projection, dtype=dtype))
+        instance.o_norm = _RecordingNorm()
+
+    config = SimpleNamespace() if enabled is None else SimpleNamespace(fuse_kda_input_projections=enabled)
+    with (
+        patch.object(BailingMoeV3KimiDeltaAttention, "__init__", fake_base_init),
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.is_conv_state_dim_first",
+            return_value=False,
+        ),
+    ):
+        return AscendBailingMoeV3KimiDeltaAttention(config)
+
+
+def test_input_projection_fusion_default_keeps_canonical_parameters_without_new_buffer():
+    attention = _input_projection_attention()
+    assert attention._ascend_fuse_input_projections is False
+    assert "ascend_input_projection_weight" not in attention._buffers
+    assert "qkvb_proj.weight" in dict(attention.named_parameters())
+    assert "f_proj.weight" in dict(attention.named_parameters())
+    assert "g_proj.weight" in dict(attention.named_parameters())
+
+
+@pytest.mark.parametrize("unsupported", ["mtp", "separate_beta", "fp32", "non_boolean"])
+def test_input_projection_fusion_rejects_unsupported_checkpoint_contracts(unsupported):
+    args = dict(enabled=True)
+    if unsupported == "mtp":
+        args["num_speculative_tokens"] = 1
+    elif unsupported == "separate_beta":
+        args["separate_b_proj"] = True
+    elif unsupported == "fp32":
+        args["dtype"] = torch.float32
+    else:
+        args["enabled"] = "true"
+    with pytest.raises(ValueError, match="KDA|fuse_kda_input_projections"):
+        _input_projection_attention(**args)
+
+
+@pytest.mark.parametrize("unsupported", ["quantized", "bias", "gather", "custom_parallel_op", "model_dtype"])
+def test_input_projection_fusion_does_not_bypass_linear_semantics(unsupported):
+    attention = _input_projection_attention(enabled=True)
+    if unsupported == "quantized":
+        attention.f_proj.quant_method = object()
+    elif unsupported == "bias":
+        attention.f_proj.bias = nn.Parameter(torch.zeros(16, dtype=torch.bfloat16), requires_grad=False)
+    elif unsupported == "gather":
+        attention.f_proj.gather_output = True
+    elif unsupported == "custom_parallel_op":
+        attention.f_proj.custom_op = object()
+    else:
+        attention.model_config.dtype = torch.float32
+    with pytest.raises(ValueError, match="BF16"):
+        attention._pack_input_projection_weights()
+
+
+def test_input_projection_pack_order_keeps_beta_after_aligned_qkv_and_gates():
+    attention = _input_projection_attention(enabled=True)
+    assert attention.get_buffer("ascend_input_projection_weight") is None
+    attention._pack_input_projection_weights()
+    weight = attention.get_buffer("ascend_input_projection_weight")
+    # Tagged canonical rows Q/K/V/B/F/G = 1/2/3/4/5/6 must become Q/K/V/F/G/B.
+    sections = weight.split((16, 16, 16, 16, 16, 2, 14), dim=0)
+    for section, expected in zip(sections, (1, 2, 3, 5, 6, 4, 0)):
+        torch.testing.assert_close(section, torch.full_like(section, expected), rtol=0, atol=0)
+    assert weight.shape == (96, 8)
+    assert "ascend_input_projection_weight" in attention._non_persistent_buffers_set
+    assert "ascend_input_projection_weight" not in attention.state_dict()
+    assert "ascend_input_projection_weight" not in dict(attention.named_parameters())
+
+
+def test_input_projection_refit_refreshes_values_without_replacing_captured_storage():
+    attention = _input_projection_attention(enabled=True)
+    attention._pack_input_projection_weights()
+    weight = attention.get_buffer("ascend_input_projection_weight")
+    pointer = weight.data_ptr()
+    canonical_parameters = {name: id(parameter) for name, parameter in attention.named_parameters()}
+    attention.f_proj.weight.fill_(7)
+    attention.g_proj.weight.fill_(8)
+    attention.qkvb_proj.weight[-2:].fill_(9)
+    attention._pack_input_projection_weights()
+    assert attention.get_buffer("ascend_input_projection_weight") is weight
+    assert weight.data_ptr() == pointer
+    assert {name: id(parameter) for name, parameter in attention.named_parameters()} == canonical_parameters
+    for section, expected in zip(weight.split((48, 16, 16, 2, 14), dim=0)[1:], (7, 8, 9, 0)):
+        torch.testing.assert_close(section, torch.full_like(section, expected), rtol=0, atol=0)
+    assert attention._ascend_input_projection_ready is True
+
+
+@pytest.mark.parametrize("changed", ["shape", "dtype", "device", "format"])
+def test_input_projection_refit_rejects_runtime_buffer_contract_changes(changed):
+    attention = _input_projection_attention(enabled=True)
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda._input_projection_weight_format",
+        return_value=2,
+    ):
+        attention._pack_input_projection_weights()
+    weight = attention.get_buffer("ascend_input_projection_weight")
+    replacement = weight
+    if changed == "shape":
+        replacement = torch.empty((97, 8), dtype=weight.dtype)
+    elif changed == "dtype":
+        replacement = weight.float()
+    elif changed == "device":
+        replacement = torch.empty(weight.shape, device="meta", dtype=weight.dtype)
+    attention.register_buffer("ascend_input_projection_weight", replacement, persistent=False)
+    with (
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda._input_projection_weight_format",
+            return_value=29 if changed == "format" else 2,
+        ),
+        pytest.raises(RuntimeError, match="cannot change after initialization"),
+    ):
+        attention._pack_input_projection_weights()
+    assert attention._ascend_input_projection_ready is False
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 4, 5])
+def test_input_projection_forward_selects_only_small_batches_and_keeps_large_order(
+    tokens,
+):
+    attention = _input_projection_attention(enabled=True)
+    attention._pack_input_projection_weights()
+    hidden = torch.full((tokens, 8), 0.125, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden)
+    calls = []
+    hooks = [
+        layer.register_forward_hook(lambda _module, _args, _output, name=name: calls.append(name))
+        for name, layer in (
+            ("qkvb", attention.qkvb_proj),
+            ("f", attention.f_proj),
+            ("g", attention.g_proj),
+        )
+    ]
+
+    def attention_call(q, k, v, gate, beta, core, _prefix):
+        core.zero_()
+        for value, expected in zip(
+            (q, k, v, gate, beta),
+            (1.0, 2.0, 3.0, 5.0, torch.sigmoid(torch.tensor(4.0)).item()),
+        ):
+            torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
+
+    try:
+        with (
+            patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", False),
+            patch(
+                "vllm_ascend.ops.bailing_moe_v3_kda.torch.ops.vllm.unquantized_gemm",
+                side_effect=torch.nn.functional.linear,
+                create=True,
+            ) as gemm,
+            patch(
+                "vllm_ascend.ops.bailing_moe_v3_kda.torch.ops.vllm.bailing_v3_kda_attention",
+                side_effect=attention_call,
+            ),
+        ):
+            attention.forward(hidden, torch.empty(tokens), output)
+        output_gate = attention.o_norm.inputs[1]
+        torch.testing.assert_close(output_gate, torch.full_like(output_gate, 6.0), rtol=0, atol=0)
+        if 0 < tokens <= 4:
+            gemm.assert_called_once()
+            assert calls == []
+        else:
+            gemm.assert_not_called()
+            assert calls == ["qkvb", "f", "g"]
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+def test_input_projection_requires_refit_postload_before_small_batch_forward():
+    attention = _input_projection_attention(enabled=True)
+    with pytest.raises(RuntimeError, match="deferred post-load/refit"):
+        attention._run_fused_input_projection(torch.ones(1, 8, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("backend", ["hccl", "npu_ipc", "nccl", "sparse_nccl"])
+def test_input_projection_fusion_requires_postload_refreshing_weight_updates(backend):
+    config = SimpleNamespace(weight_transfer_config=SimpleNamespace(backend=backend))
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.get_current_vllm_config_or_none",
+        return_value=config,
+    ):
+        if backend == "sparse_nccl":
+            with pytest.raises(ValueError, match="sparse_nccl"):
+                _input_projection_attention(enabled=True)
+            # The opt-in restriction must not affect the default model path.
+            assert _input_projection_attention()._ascend_fuse_input_projections is False
+        else:
+            _input_projection_attention(enabled=True)
+
+
+def test_input_projection_real_deferred_finalize_restores_and_refreshes_captured_buffers():
+    attention = _input_projection_attention(enabled=True)
+    attention.process_weights_after_loading(torch.bfloat16)
+    captured = get_layer_params_buffers(attention)
+    conv = attention.get_buffer("ascend_conv1d_weight")
+    projection = attention.get_buffer("ascend_input_projection_weight")
+    original_pointers = (conv.data_ptr(), projection.data_ptr())
+    canonical_ids = {name: id(parameter) for name, parameter in attention.named_parameters()}
+    for order, values in (("fg", (7, 8, 9)), ("gf", (10, 11, 12))):
+        f_value, g_value, b_value = values
+        for name in order:
+            getattr(attention, name + "_proj").weight.fill_(f_value if name == "f" else g_value)
+        attention.qkvb_proj.weight[-2:].fill_(b_value)
+        # RL restore may delete the derived buffers, but finalize must restore
+        # their captured storage before this parent's post-load repacks them.
+        delattr(attention, "ascend_input_projection_weight")
+        delattr(attention, "ascend_conv1d_weight")
+        info = LayerReloadingInfo(
+            restore_metadata=({}, {}),
+            restore_device=torch.device("cpu"),
+            kernel_tensors=captured,
+            kernel_non_persistent_buffers={"ascend_conv1d_weight", "ascend_input_projection_weight"},
+        )
+        _finalize_attention_layer(attention, info, SimpleNamespace(dtype=torch.bfloat16))
+        assert attention.get_buffer("ascend_conv1d_weight") is conv
+        assert attention.get_buffer("ascend_input_projection_weight") is projection
+        assert (conv.data_ptr(), projection.data_ptr()) == original_pointers
+        assert {name: id(parameter) for name, parameter in attention.named_parameters()} == canonical_ids
+        for section, expected in zip(projection.split((48, 16, 16, 2, 14), dim=0)[1:], (*values, 0)):
+            torch.testing.assert_close(section, torch.full_like(section, expected), rtol=0, atol=0)
+        assert attention._ascend_input_projection_ready
+        assert attention._ascend_conv_weights_ready
+        assert {"ascend_conv1d_weight", "ascend_input_projection_weight"} <= attention._non_persistent_buffers_set
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+def test_fused_projection_uses_j_native_prepare_without_qkv_cat_or_gate_mutation(num_tokens):
+    attention = _input_projection_attention(enabled=True)
+    attention._pack_input_projection_weights()
+    hidden = torch.full((num_tokens, attention.hidden_size), 0.125, dtype=torch.bfloat16)
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.torch.ops.vllm.unquantized_gemm",
+        side_effect=torch.nn.functional.linear,
+        create=True,
+    ):
+        qkv, f_values, g_values, beta = attention._run_fused_input_projection(hidden)
+    q, k, v = qkv.chunk(3, dim=-1)
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", side_effect=AssertionError("unexpected QKV cat")):
+        mixed = _contiguous_packed_qkv(q, k, v, allow_row_gaps=True)
+    assert mixed.data_ptr() == qkv.data_ptr()
+    assert mixed.stride() == qkv.stride()
+    assert mixed.is_contiguous() == (num_tokens == 1)
+    before = [value.clone() for value in (qkv, f_values, g_values, beta)]
+    channels = qkv.shape[1]
+    state = torch.empty(num_tokens + 2, 3, channels, dtype=torch.bfloat16)
+    indices = torch.arange(1, num_tokens + 1, dtype=torch.int32)
+    starts = torch.arange(num_tokens + 1, dtype=torch.int32)
+
+    def prepare(_indices, _starts, _slots, _null, _output, **kwargs):
+        if num_tokens == 1:
+            assert kwargs == {}
+        else:
+            assert kwargs["input_tensor"] is mixed
+            assert kwargs["packed_input"].is_contiguous()
+            kwargs["packed_input"].copy_(mixed)
+        return indices
+
+    def native(value, _state, _weight, **kwargs):
+        assert value.is_contiguous()
+        torch.testing.assert_close(value, before[0], rtol=0, atol=0)
+        kwargs["out"].copy_(value)
+        return kwargs["out"]
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as prepared,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native) as update,
+    ):
+        actual = attention._run_causal_conv1d(
+            mixed,
+            torch.empty(4, channels, dtype=torch.bfloat16),
+            state,
+            starts,
+            indices,
+            None,
+            run_mode=1,
+            max_query_len=1,
+        )
+    assert prepared.call_count == update.call_count == 1
+    torch.testing.assert_close(actual, before[0], rtol=0, atol=0)
+    for value, expected in zip((qkv, f_values, g_values, beta), before):
+        torch.testing.assert_close(value, expected, rtol=0, atol=0)
+
+
+def test_input_projection_fusion_rejects_lora_without_changing_the_default_path():
+    config = SimpleNamespace(lora_config=SimpleNamespace(max_lora_rank=16))
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.get_current_vllm_config_or_none",
+        return_value=config,
+    ):
+        with pytest.raises(ValueError, match="LoRA"):
+            _input_projection_attention(enabled=True)
+        attention = _input_projection_attention()
+        assert attention._ascend_fuse_input_projections is False
+        assert "ascend_input_projection_weight" not in attention._buffers
