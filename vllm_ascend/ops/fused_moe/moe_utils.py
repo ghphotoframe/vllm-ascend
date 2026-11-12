@@ -474,6 +474,52 @@ def _pad_tokens_pair(
     )
 
 
+def _pad_and_split_tokens_pair(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    target_len: int,
+    *,
+    tp_size: int,
+    tp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match pair-padding then TP splitting, without materializing other ranks' rows.
+
+    The fast path creates fresh local outputs and preserves payload bits. Its
+    caller retains the global padded shape for finalize; masks and LoRA indices
+    remain the caller's responsibility.
+    """
+    pad_rows = target_len - hidden_states.shape[0]
+    assert pad_rows >= 0, "target_len cannot remove input rows"
+    if (
+        tp_size > 1
+        and 0 <= tp_rank < tp_size
+        and target_len % tp_size == 0
+        and hidden_states.ndim == router_logits.ndim == 2
+        and hidden_states.shape[0] == router_logits.shape[0]
+        and hidden_states.shape[1] > 0
+        and router_logits.shape[1] > 0
+        and hidden_states.dtype == torch.bfloat16
+        and router_logits.dtype == torch.float32
+        and hidden_states.device.type == "npu"
+        and hidden_states.device == router_logits.device
+        and hidden_states.is_contiguous()
+        and router_logits.is_contiguous()
+        and 0 <= hidden_states.shape[0] <= tp_size
+        and 0 < pad_rows <= tp_size
+        and torch_npu.get_npu_format(hidden_states) == _NPU_FORMAT_ND
+        and torch_npu.get_npu_format(router_logits) == _NPU_FORMAT_ND
+    ):
+        from vllm_ascend.ops.triton.moe_token_padding import pad_and_split_tokens_pair
+
+        return pad_and_split_tokens_pair(hidden_states, router_logits, target_len, tp_size=tp_size, tp_rank=tp_rank)
+    if pad_rows > 0:
+        hidden_states, router_logits = _pad_tokens_pair(hidden_states, router_logits, target_len, tp_size=tp_size)
+    if tp_size > 1:
+        hidden_states = torch.tensor_split(hidden_states, tp_size, dim=0)[tp_rank]
+        router_logits = torch.tensor_split(router_logits, tp_size, dim=0)[tp_rank]
+    return hidden_states, router_logits
+
+
 def _pad_tokens_with_cat(x: torch.Tensor, padded_len: int, *, tp_size: int | None = None) -> torch.Tensor:
     """Token-dim padding of `x` ([n, ...] -> [padded_len, ...]) by concatenating
     a slice of a cached zero block: value-equivalent to

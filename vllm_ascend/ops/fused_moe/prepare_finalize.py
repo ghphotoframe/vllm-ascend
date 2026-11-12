@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.lora.fused_moe import prepare_lora_indices
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
-from vllm_ascend.ops.fused_moe.moe_utils import _pad_tokens_pair
+from vllm_ascend.ops.fused_moe.moe_utils import _pad_and_split_tokens_pair, _pad_tokens_pair
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 
@@ -159,18 +159,25 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
                     tp_rank=self.tp_rank,
                 )
 
-            if pad_size > 0:
-                hidden_states, router_logits = _pad_tokens_pair(
-                    hidden_states, router_logits, self.num_tokens + pad_size, tp_size=self.tp_size
+            if pad_size > 0 and self.lora_context is None:
+                target_len = self.num_tokens + pad_size
+                padded_hidden_states_shape = torch.Size((target_len, *hidden_states.shape[1:]))
+                hidden_states, router_logits = _pad_and_split_tokens_pair(
+                    hidden_states, router_logits, target_len, tp_size=self.tp_size, tp_rank=self.tp_rank
                 )
-                padded_hidden_states_shape = hidden_states.shape
+            else:
+                if pad_size > 0:
+                    hidden_states, router_logits = _pad_tokens_pair(
+                        hidden_states, router_logits, self.num_tokens + pad_size, tp_size=self.tp_size
+                    )
+                    padded_hidden_states_shape = hidden_states.shape
 
-            if self.tp_size > 1:
-                split_hidden_states = torch.tensor_split(hidden_states, self.tp_size, dim=0)
-                split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
+                if self.tp_size > 1:
+                    split_hidden_states = torch.tensor_split(hidden_states, self.tp_size, dim=0)
+                    split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
 
-                hidden_states = split_hidden_states[self.tp_rank]
-                router_logits = split_router_logits[self.tp_rank]
+                    hidden_states = split_hidden_states[self.tp_rank]
+                    router_logits = split_router_logits[self.tp_rank]
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,
@@ -294,18 +301,24 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             target_pad_length = _EXTRA_CTX.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
 
-            if pad_size > 0:
-                hidden_states, router_logits = _pad_tokens_pair(
-                    hidden_states, router_logits, target_pad_length, tp_size=self.tp_size
+            if pad_size > 0 and self.lora_context is None:
+                padded_hidden_states_shape = torch.Size((target_pad_length, *hidden_states.shape[1:]))
+                hidden_states, router_logits = _pad_and_split_tokens_pair(
+                    hidden_states, router_logits, target_pad_length, tp_size=self.tp_size, tp_rank=self.tp_rank
                 )
-                padded_hidden_states_shape = hidden_states.shape
+            else:
+                if pad_size > 0:
+                    hidden_states, router_logits = _pad_tokens_pair(
+                        hidden_states, router_logits, target_pad_length, tp_size=self.tp_size
+                    )
+                    padded_hidden_states_shape = hidden_states.shape
 
-            # Slice across TP ranks
-            if self.tp_size > 1:
-                split_hidden_states = torch.tensor_split(hidden_states, self.tp_size, dim=0)
-                split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
-                hidden_states = split_hidden_states[self.tp_rank]
-                router_logits = split_router_logits[self.tp_rank]
+                # Slice across TP ranks
+                if self.tp_size > 1:
+                    split_hidden_states = torch.tensor_split(hidden_states, self.tp_size, dim=0)
+                    split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
+                    hidden_states = split_hidden_states[self.tp_rank]
+                    router_logits = split_router_logits[self.tp_rank]
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,

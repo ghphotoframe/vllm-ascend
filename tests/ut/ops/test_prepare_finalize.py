@@ -71,6 +71,39 @@ class TestPrepareAndFinalize(unittest.TestCase):
                         torch.testing.assert_close(prepared.router_logits, expected_logits[rank : rank + 1])
                         self.assertEqual(prepared.padded_hidden_states_shape, torch.Size([8, 8]))
 
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=8)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=3)
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_fused_local_pair_keeps_global_shape_mask_and_lora_original_path(self, context, *_):
+        ctx = MagicMock()
+        ctx.mc2_mask = torch.arange(8) < 4
+        ctx.padded_num_tokens = 8
+        context.return_value = ctx
+        hidden = torch.arange(4 * 8, dtype=torch.bfloat16).reshape(4, 8)
+        router = torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2)
+        for cls in (PrepareAndFinalizeWithAll2All, PrepareAndFinalizeWithMC2):
+            layer = cls(self.moe_config)
+            with patch(
+                "vllm_ascend.ops.fused_moe.prepare_finalize._pad_and_split_tokens_pair",
+                return_value=(hidden[3:4], router[3:4]),
+            ) as fused:
+                result = layer.prepare(hidden, router)
+            fused.assert_called_once_with(hidden, router, 8, tp_size=8, tp_rank=3)
+            self.assertEqual(result.padded_hidden_states_shape, torch.Size([8, 8]))
+            torch.testing.assert_close(result.hidden_states, hidden[3:4])
+            if cls is PrepareAndFinalizeWithMC2:
+                torch.testing.assert_close(result.mc2_mask, ctx.mc2_mask[3:4])
+            layer.lora_context = object()
+            with (
+                patch(
+                    "vllm_ascend.ops.fused_moe.prepare_finalize._pad_and_split_tokens_pair", side_effect=AssertionError
+                ),
+                patch("vllm_ascend.ops.fused_moe.prepare_finalize.prepare_lora_indices"),
+            ):
+                result = layer.prepare(hidden, router)
+            torch.testing.assert_close(result.hidden_states, hidden[3:4])
+            self.assertEqual(result.padded_hidden_states_shape, torch.Size([8, 8]))
+
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")

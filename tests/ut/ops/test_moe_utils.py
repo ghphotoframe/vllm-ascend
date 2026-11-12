@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.ops.fused_moe.moe_utils import (
     _custom_gmm_swiglu_enabled,
     _get_cann_mega_moe_quant_settings,
+    _pad_and_split_tokens_pair,
     _pad_tokens_pair,
     _pad_tokens_with_cat,
     _prepare_dequant_swiglu_weight_scale,
@@ -22,6 +23,93 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 
 class TestTokenPadding(unittest.TestCase):
+    def test_pad_split_pair_matches_global_padding_for_all_tp_ranks(self):
+        for tp_size in (2, 8, 16):
+            for rows in (0, 1, 2, 4, 8, 9, 16):
+                for strided in (False, True):
+                    hidden = torch.arange(rows * 10, dtype=torch.bfloat16).reshape(rows, 10)
+                    router = torch.arange(rows * 6, dtype=torch.float32).reshape(rows, 6)
+                    if strided:
+                        hidden, router = hidden[:, ::2], router[:, ::2]
+                    originals = hidden.clone(), router.clone()
+                    target = max(tp_size, ((rows + tp_size - 1) // tp_size) * tp_size)
+                    padded = tuple(torch.nn.functional.pad(x, (0, 0, 0, target - rows)) for x in originals)
+                    for rank in range(tp_size):
+                        with self.subTest(tp_size=tp_size, rows=rows, strided=strided, rank=rank):
+                            actual = _pad_and_split_tokens_pair(hidden, router, target, tp_size=tp_size, tp_rank=rank)
+                            for result, reference, source, before in zip(actual, padded, (hidden, router), originals):
+                                self.assertTrue(torch.equal(result, torch.tensor_split(reference, tp_size)[rank]))
+                                self.assertEqual(result.dtype, source.dtype)
+                                self.assertTrue(torch.equal(source, before))
+
+    def test_pad_split_pair_submits_only_local_shard_to_device_kernel(self):
+        module_name = "vllm_ascend.ops.triton.moe_token_padding"
+        module = ModuleType(module_name)
+        outputs = object(), object()
+        module.pad_and_split_tokens_pair = MagicMock(return_value=outputs)
+        for tp_size in (2, 8, 16):
+            for rows in (0, 1, 2, 4, 8):
+                if rows >= tp_size:
+                    continue
+                for rank in range(tp_size):
+                    hidden = self._npu_padding_input(rows, 2560, torch.bfloat16)
+                    router = self._npu_padding_input(rows, 512, torch.float32)
+                    with (
+                        self.subTest(tp_size=tp_size, rows=rows, rank=rank),
+                        patch.dict(sys.modules, {module_name: module}),
+                        patch(
+                            "vllm_ascend.ops.fused_moe.moe_utils.torch_npu.get_npu_format", return_value=2, create=True
+                        ),
+                        patch("vllm_ascend.ops.fused_moe.moe_utils._pad_tokens_pair", side_effect=AssertionError),
+                    ):
+                        module.pad_and_split_tokens_pair.reset_mock()
+                        self.assertIs(
+                            _pad_and_split_tokens_pair(hidden, router, tp_size, tp_size=tp_size, tp_rank=rank), outputs
+                        )
+                        module.pad_and_split_tokens_pair.assert_called_once_with(
+                            hidden, router, tp_size, tp_size=tp_size, tp_rank=rank
+                        )
+
+    def test_pad_split_pair_preserves_fallback_and_unequal_chunks(self):
+        hidden = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+        router = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+        for target, tp_size in ((3, 8), (7, 8), (16, 8), (3, 1)):
+            padded = tuple(torch.nn.functional.pad(x, (0, 0, 0, target - 3)) for x in (hidden, router))
+            for rank in range(tp_size):
+                actual = _pad_and_split_tokens_pair(hidden, router, target, tp_size=tp_size, tp_rank=rank)
+                for result, reference in zip(actual, padded):
+                    self.assertTrue(torch.equal(result, torch.tensor_split(reference, tp_size)[rank]))
+        with self.assertRaises(AssertionError):
+            _pad_and_split_tokens_pair(hidden, router, 2, tp_size=8, tp_rank=0)
+
+    def test_pad_split_pair_storage_format_and_stride_keep_original_fallback(self):
+        for invalid in ("dtype", "stride", "format", "large_batch", "uneven"):
+            hidden = self._npu_padding_input(1, 2560, torch.bfloat16)
+            router = self._npu_padding_input(1, 512, torch.float32)
+            target = 8
+            if invalid == "dtype":
+                router.dtype = torch.bfloat16
+            elif invalid == "stride":
+                hidden.is_contiguous = lambda: False
+            elif invalid == "large_batch":
+                hidden.shape, router.shape, target = (9, 2560), (9, 512), 16
+            elif invalid == "uneven":
+                target = 7
+            pair = torch.zeros(target, 4), torch.zeros(target, 2)
+            with (
+                self.subTest(invalid=invalid),
+                patch("vllm_ascend.ops.fused_moe.moe_utils._pad_tokens_pair", return_value=pair) as old,
+                patch(
+                    "vllm_ascend.ops.fused_moe.moe_utils.torch_npu.get_npu_format",
+                    return_value=29 if invalid == "format" else 2,
+                    create=True,
+                ),
+            ):
+                actual = _pad_and_split_tokens_pair(hidden, router, target, tp_size=8, tp_rank=3)
+                old.assert_called_once_with(hidden, router, target, tp_size=8)
+                for result, source in zip(actual, pair):
+                    self.assertTrue(torch.equal(result, torch.tensor_split(source, 8)[3]))
+
     def test_explicit_tp_preserves_padding_without_current_config(self):
         # V2 capture can run without the initialization-only config context.
         # The caller still knows its physical TP size, including under EP.
@@ -168,10 +256,12 @@ class TestTokenPadding(unittest.TestCase):
                     ) as single_pad,
                     patch(
                         "vllm_ascend.ops.fused_moe.moe_utils.torch_npu.get_npu_format",
-                        side_effect=lambda value, case=case, hidden=hidden, router=router: 29
-                        if (case == "hidden_storage_format" and value is hidden)
-                        or (case == "router_storage_format" and value is router)
-                        else 2,
+                        side_effect=lambda value, case=case, hidden=hidden, router=router: (
+                            29
+                            if (case == "hidden_storage_format" and value is hidden)
+                            or (case == "router_storage_format" and value is router)
+                            else 2
+                        ),
                         create=True,
                     ),
                 ):
