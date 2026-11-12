@@ -31,7 +31,12 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    DeviceAdaptorFamily,
+    HardwareCapability,
+    MoECommPolicy,
+    get_current_hardware_profile,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -575,6 +580,9 @@ class AscendConfig:
         == DeviceAdaptorFamily.FP8_OPTIMIZED
     )
     enable_prefill_mc2: bool = False
+    # Opt in to local expert routing plus one TP reduction for small batches.
+    # Counts the full batch, before the MC2 TP split; zero keeps hardware policy.
+    moe_allgather_token_threshold: int = Field(default=0, ge=0)
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -848,6 +856,8 @@ class AscendConfig:
                 "recompute_scheduler_enable=true: it keeps decode-node steps decode-shaped.",
             )
 
+        self._validate_moe_allgather_token_threshold(vc)
+
         # enable_fused_mc2 enum + MiniMax mutex + multistream auto-disable
         assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
         model_architectures = getattr(vc.model_config, "architectures", None) or []
@@ -1020,6 +1030,54 @@ class AscendConfig:
                 "fused mc2 op cannot be used with hierarchy communication. "
                 "Please set additional_config.enable_fused_mc2 to 0."
             )
+
+    def _validate_moe_allgather_token_threshold(self, vllm_config: VllmConfig) -> None:
+        if self.moe_allgather_token_threshold == 0:
+            return
+        prefix = "moe_allgather_token_threshold>0"
+        profile = get_current_hardware_profile()
+        parallel = vllm_config.parallel_config
+        # FUSED_OR_CAPACITY is the A3 hardware policy. Keep the experiment
+        # scoped without making models depend on a raw SoC name.
+        if profile.moe_comm_policy is not MoECommPolicy.FUSED_OR_CAPACITY:
+            raise ValueError(f"{prefix} currently supports only A3.")
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(f"{prefix} requires Model Runner V2.")
+        if not vllm_config.model_config.is_moe:
+            raise ValueError(f"{prefix} requires a MoE model.")
+        if not parallel.enable_expert_parallel or parallel.tensor_parallel_size <= 1:
+            raise ValueError(f"{prefix} requires expert parallelism and TP>1.")
+        if parallel.data_parallel_size != 1 or parallel.prefill_context_parallel_size != 1:
+            raise ValueError(f"{prefix} currently requires DP1 and PCP1.")
+        if parallel.use_sequence_parallel_moe:
+            raise ValueError(f"{prefix} requires replicated token inputs; sequence-parallel MoE is not supported.")
+        if parallel.expert_placement_strategy != "linear":
+            raise ValueError(f"{prefix} currently requires linear expert placement for the public active_expert_range.")
+        if vllm_config.lora_config is not None or vllm_config.speculative_config is not None:
+            raise ValueError(f"{prefix} currently does not support LoRA or speculative decoding.")
+        if self.enable_fused_mc2 != 0:
+            raise ValueError(f"{prefix} requires enable_fused_mc2=0.")
+
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_text_config
+        quant_config = vllm_config.quant_config
+        quant_description = getattr(quant_config, "quant_description", None)
+        # --quantization ascend can also load FLOAT/BF16 expert weights.
+        # Match the existing MegaMoE policy's routed-weight metadata check.
+        quantized_experts = any(getattr(hf_config, name, None) is not None for name in ("moe_quantize", "quantize"))
+        if quant_config is not None:
+            if not isinstance(quant_description, dict):
+                quantized_experts = True
+            else:
+                quantized_experts |= any(
+                    isinstance(name, str)
+                    and ".experts." in f".{name}"
+                    and name.endswith(".weight")
+                    and kind not in (None, "FLOAT")
+                    for name, kind in quant_description.items()
+                )
+        if model_config.dtype != torch.bfloat16 or quantized_experts:
+            raise ValueError(f"{prefix} currently supports only BF16 unquantized routed experts.")
 
     def _validate_megamoe_decode_policy(self, vllm_config: VllmConfig) -> None:
         if not self.disable_megamoe_for_decode or self.enable_fused_mc2 != 1 or not is_mega_moe_supported():

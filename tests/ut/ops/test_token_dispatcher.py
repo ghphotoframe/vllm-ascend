@@ -1190,3 +1190,107 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+@pytest.mark.parametrize("threshold", [0, 4])
+@pytest.mark.parametrize("rows", [1, 4, 5])
+def test_allgather_combine_opt_in_keeps_fp32_probs_using_original_full_rows(threshold, rows):
+    topk, width = 8, 16
+    hidden = torch.linspace(-0.75, 0.75, rows * topk * width).view(-1, width).bfloat16()
+    indices = torch.arange(rows * topk - 1, -1, -1, dtype=torch.int32)
+    weights = torch.linspace(0.0012345, 0.9876543, rows * topk).view(rows, topk)
+    weights[:, 0] = 0  # Preserve the dispatch-stage mask, including nonlocal experts.
+    original_weights = weights.clone()
+    metadata = MoEAllGatherCombineMetadata(weights, indices, torch.Size([rows, width]))
+    keep = threshold > 0 and rows <= threshold
+    expected_probs = weights if keep else weights.bfloat16()
+
+    def unpermute(*, permuted_tokens, sorted_indices, probs):
+        assert permuted_tokens is hidden and sorted_indices is indices
+        assert probs.dtype == (torch.float32 if keep else torch.bfloat16)
+        if keep:
+            assert probs is weights
+        torch.testing.assert_close(probs, expected_probs, rtol=0, atol=0)
+        return (
+            (permuted_tokens[sorted_indices.long()].double().view(rows, topk, width) * probs.double().unsqueeze(-1))
+            .sum(1)
+            .to(hidden.dtype)
+        )
+
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config",
+            return_value=SimpleNamespace(moe_allgather_token_threshold=threshold),
+        ),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_token_unpermute", side_effect=unpermute
+        ) as op,
+    ):
+        output = TokenDispatcherWithAllGather().token_combine(hidden, metadata)
+    reference = (
+        (hidden[indices.long()].double().view(rows, topk, width) * expected_probs.double().unsqueeze(-1))
+        .sum(1)
+        .to(hidden.dtype)
+    )
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    torch.testing.assert_close(weights, original_weights, rtol=0, atol=0)
+    op.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "hidden_dtype,weights_dtype",
+    [(torch.float32, torch.float32), (torch.float16, torch.float32), (torch.bfloat16, torch.bfloat16)],
+)
+def test_allgather_opt_in_preserves_other_dtype_cast_contracts(hidden_dtype, weights_dtype):
+    hidden = torch.ones(16, 8, dtype=hidden_dtype)
+    weights = torch.tensor([[0.1001234] * 8] * 2, dtype=weights_dtype)
+    indices = torch.arange(16, dtype=torch.int32)
+    metadata = MoEAllGatherCombineMetadata(weights, indices, torch.Size([2, 8]))
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config",
+            return_value=SimpleNamespace(moe_allgather_token_threshold=4),
+        ),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_token_unpermute", return_value=hidden[:2]
+        ) as op,
+    ):
+        TokenDispatcherWithAllGather().token_combine(hidden, metadata)
+    probs = op.call_args.kwargs["probs"]
+    assert probs.dtype == hidden_dtype
+    torch.testing.assert_close(probs, weights.to(hidden_dtype), rtol=0, atol=0)
+
+
+def test_allgather_opt_in_3d_restore_uses_full_tokens_and_keeps_output_shape():
+    hidden = torch.ones(16, 8, dtype=torch.bfloat16)
+    weights = torch.full((2, 8), 0.1234567)
+    metadata = MoEAllGatherCombineMetadata(weights, torch.arange(16, dtype=torch.int32), torch.Size([1, 2, 8]))
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config",
+            return_value=SimpleNamespace(moe_allgather_token_threshold=2),
+        ),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_token_unpermute", return_value=hidden[:2]
+        ) as op,
+    ):
+        output = TokenDispatcherWithAllGather().token_combine(hidden, metadata)
+    assert op.call_args.kwargs["probs"] is weights
+    assert output.shape == (1, 2, 8)
+
+
+def test_allgather_default_does_not_require_new_restore_shape_metadata_methods():
+    hidden = torch.ones(16, 8, dtype=torch.bfloat16)
+    weights = torch.full((2, 8), 0.1234567)
+    metadata = MoEAllGatherCombineMetadata(weights, torch.arange(16, dtype=torch.int32), (2, 8))
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config",
+            return_value=SimpleNamespace(moe_allgather_token_threshold=0),
+        ),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_token_unpermute", return_value=hidden[:2]
+        ) as op,
+    ):
+        TokenDispatcherWithAllGather().token_combine(hidden, metadata)
+    assert op.call_args.kwargs["probs"].dtype == torch.bfloat16

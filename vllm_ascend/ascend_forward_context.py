@@ -420,6 +420,17 @@ def select_moe_comm_method(
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
+    elif (
+        moe_comm_policy is MoECommPolicy.FUSED_OR_CAPACITY
+        and get_ascend_config().enable_fused_mc2 == 0
+        and not is_draft_model
+        and num_tokens is not None
+        and 0 < num_tokens <= getattr(get_ascend_config(), "moe_allgather_token_threshold", 0)
+    ):
+        # Config validation limits this opt-in to replicated BF16 inputs.
+        # Use the full-batch count for capture and replay alike, including
+        # short prefills: no Python phase/shape branch inside a compiled model.
+        moe_comm_type = MoECommType.ALLGATHER
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     elif (
