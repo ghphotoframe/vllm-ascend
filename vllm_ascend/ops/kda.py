@@ -74,6 +74,18 @@ def run_chunk_kda(
     """Consume preprocessed beta and return output plus the final VK state."""
     from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 
+    # A batch that holds a single sequence spanning every token is the dense
+    # case: the varlen path costs up to 2x more on A2/A3 for bit-identical
+    # output and final state, so drop the segment metadata when it is implied.
+    if (
+        isinstance(cu_seqlens, (list, tuple))
+        and len(cu_seqlens) == 2
+        and cu_seqlens[0] == 0
+        and cu_seqlens[1] == q.shape[1]
+    ):
+        cu_seqlens = None
+        chunk_indices = None
+
     output, final_state, *_ = chunk_kda_fwd(
         l2norm_fwd(q.contiguous()),
         l2norm_fwd(k.contiguous()),
