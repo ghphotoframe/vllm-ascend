@@ -139,6 +139,32 @@ def test_packed_qkv_accepts_empty_graph_token_slices():
     assert actual.is_contiguous()
 
 
+@pytest.mark.parametrize("num_actual_tokens", [1, 3, 5])
+def test_prefill_packs_the_valid_rows_of_fused_qkv_once(num_actual_tokens):
+    width, row_stride = 512, 2576
+    projection = torch.arange(6 * row_stride, dtype=torch.int32).reshape(6, row_stride).to(torch.bfloat16)
+    q, k, v = projection[1:, : 3 * width].split(width, dim=-1)
+    expected = torch.cat((q[:num_actual_tokens], k[:num_actual_tokens], v[:num_actual_tokens]), dim=-1)
+    original = projection.clone()
+
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", side_effect=AssertionError("unexpected QKV cat")):
+        actual = _contiguous_packed_qkv(q, k, v, num_actual_tokens=num_actual_tokens)
+
+    assert actual.is_contiguous()
+    assert (actual.untyped_storage().data_ptr() == projection.untyped_storage().data_ptr()) == (num_actual_tokens == 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(projection, original, rtol=0, atol=0)
+
+
+def test_prefill_packing_falls_back_for_unshared_storage():
+    projected = torch.arange(5 * 9, dtype=torch.bfloat16).reshape(5, 9)
+    q, k, v = (tensor.clone() for tensor in projected.chunk(3, dim=-1))
+    actual = _contiguous_packed_qkv(q, k, v, num_actual_tokens=3)
+
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, projected[:3], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shared_projection", [False, True], ids=["independent", "packed"])
 def test_packed_qkv_fake_tensors_use_cat_without_storage_pointer_access(shared_projection):
     with FakeTensorMode():
@@ -848,18 +874,26 @@ def test_spec_padding_discards_unwritten_nan_output():
 
 
 @pytest.mark.parametrize(
-    ("seq_lens", "query_lens", "draft_tokens"),
+    ("seq_lens", "query_lens", "draft_tokens", "fused_projection"),
     [
-        pytest.param([3, 4], [3, 2], None, id="prefill"),
-        pytest.param([10, 20], [1, 1], None, id="decode"),
-        pytest.param([10, 8, 7], [1, 4, 2], None, id="decode-prefill"),
-        pytest.param([10, 20], [3, 3], [2, 2], id="spec"),
-        pytest.param([10, 7, 20], [3, 4, 1], [2, -1, -1], id="spec-prefill-decode"),
+        pytest.param([3, 4], [3, 2], None, False, id="prefill"),
+        pytest.param([3, 4], [3, 2], None, True, id="prefill-fused-projection"),
+        pytest.param([10, 20], [1, 1], None, False, id="decode"),
+        pytest.param([10, 8, 7], [1, 4, 2], None, False, id="decode-prefill"),
+        pytest.param([10, 8, 7], [1, 4, 2], None, True, id="decode-prefill-fused-projection"),
+        pytest.param([10, 20], [3, 3], [2, 2], False, id="spec"),
+        pytest.param([10, 7, 20], [3, 4, 1], [2, -1, -1], False, id="spec-prefill-decode"),
     ],
 )
 @pytest.mark.parametrize("flash_kda_enabled", [False, True])
 def test_forward_routes_real_builder_metadata_and_clears_tail(
-    monkeypatch, seq_lens, query_lens, draft_tokens, flash_kda_enabled, extra_unassigned_tokens=0
+    monkeypatch,
+    seq_lens,
+    query_lens,
+    draft_tokens,
+    flash_kda_enabled,
+    fused_projection,
+    extra_unassigned_tokens=0,
 ):
     _patch_missing_runtime_cdiv(monkeypatch)
     num_speculative_tokens = 2 if draft_tokens is not None else 0
@@ -872,9 +906,14 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(
     metadata.num_actual_tokens = num_actual_tokens
     num_allocated_tokens = num_actual_tokens + 2
     head_dim = 2
-    q = torch.arange(num_allocated_tokens * head_dim, dtype=torch.float32).reshape(-1, head_dim)
-    k = q + 100
-    v = q + 200
+    if fused_projection:
+        row_stride = 16
+        projected = torch.arange(num_allocated_tokens * row_stride, dtype=torch.bfloat16).reshape(-1, row_stride)
+        q, k, v = projected[:, : 3 * head_dim].split(head_dim, dim=-1)
+    else:
+        q = torch.arange(num_allocated_tokens * head_dim, dtype=torch.float32).reshape(-1, head_dim)
+        k = q + 100
+        v = q + 200
     raw_gate = torch.zeros(1, num_allocated_tokens, 1, head_dim)
     beta_logits = torch.linspace(-8, 8, num_allocated_tokens, dtype=torch.bfloat16).reshape(1, -1, 1)
     beta = beta_logits if flash_kda_enabled else beta_logits.float().sigmoid()
@@ -900,6 +939,7 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(
         prefix="model.layers.0.linear_attn",
         head_dim=head_dim,
         num_speculative_tokens=num_speculative_tokens,
+        _ascend_fuse_input_projections=fused_projection,
         kv_cache=(torch.zeros(1), torch.zeros(1)),
         _conv_weights_t=lambda _dtype: torch.empty(1),
         _run_causal_conv1d=conv,
@@ -914,6 +954,7 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(
             return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
         ),
         patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
+        patch("vllm_ascend.ops.bailing_moe_v3_kda._contiguous_packed_qkv", wraps=_contiguous_packed_qkv) as pack,
     ):
         AscendBailingMoeV3KimiDeltaAttention._forward(
             attention,
@@ -924,6 +965,14 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(
             beta,
             core_attn_out,
         )
+
+    if fused_projection:
+        pack.assert_called_once()
+        uses_prefill_pack = metadata.num_decodes == 0
+        assert ("num_actual_tokens" in pack.call_args.kwargs) == uses_prefill_pack
+        conv_input = conv.call_args.args[0]
+        assert conv_input.is_contiguous()
+        torch.testing.assert_close(conv_input, projected[:num_actual_tokens, : 3 * head_dim], rtol=0, atol=0)
 
     expected = torch.zeros_like(core_attn_out)
     if metadata.spec_sequence_masks is not None:
@@ -982,6 +1031,7 @@ def test_mixed_spec_scatter_clears_unassigned_graph_rows(monkeypatch, flash_kda_
         query_lens=[3, 4, 1],
         draft_tokens=[2, -1, -1],
         flash_kda_enabled=flash_kda_enabled,
+        fused_projection=False,
         extra_unassigned_tokens=1,
     )
 
