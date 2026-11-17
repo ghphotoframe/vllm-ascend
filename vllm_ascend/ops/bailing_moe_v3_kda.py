@@ -29,6 +29,7 @@ from vllm_ascend.ops.kda_conv import (
     prepare_native_conv_decode,
     run_causal_conv1d,
 )
+from vllm_ascend.ops.kda_state_copy_plan import StridedKDAFallbackPlan
 from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
 from vllm_ascend.ops.triton.kda.conv_state import (
     copy_conv_state,
@@ -653,7 +654,10 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         state_copy = getattr(self, "_ascend_kda_state_copy", None)
         if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
             raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
-        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state)
+        # Reuse offsets only for the immutable batch indices shared by KDA
+        # layers. Compacted indices and native plans retain their existing path.
+        copy_kwargs = {"reuse_offsets": True} if keep is None and isinstance(state_copy, StridedKDAFallbackPlan) else {}
+        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state, **copy_kwargs)
         prefill_kwargs = {"lower_bound": self.lower_bound if self.safe_gate else None}
         if FLASH_KDA_ENABLED:
             if prebuilt_metadata.flash_cu_seqlens is None:
@@ -672,7 +676,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             self.dt_bias,
             **prefill_kwargs,
         )
-        state_copy.scatter(recurrent_state, final_state, state_indices)
+        state_copy.scatter(recurrent_state, final_state, state_indices, **copy_kwargs)
         return output
 
     @eager_break_during_capture
