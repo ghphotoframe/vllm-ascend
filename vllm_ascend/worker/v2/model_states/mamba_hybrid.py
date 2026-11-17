@@ -355,5 +355,14 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             for_cudagraph_capture=for_capture,
+            share_gdn_decode_columns=(
+                cudagraph_mode == CUDAGraphMode.FULL
+                and not for_capture
+                and not input_batch.is_dummy
+                and self.vllm_config.num_speculative_tokens == 0
+                and input_batch.num_reqs > 0
+                and input_batch.num_tokens == input_batch.num_reqs
+                and not input_batch.is_prefilling_np.any()
+            ),
         )
         return self.attn_metadata

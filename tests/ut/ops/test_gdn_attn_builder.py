@@ -888,6 +888,31 @@ def test_full_graph_non_spec_actual_seq_lengths_use_padded_builder_buffer():
     assert torch.all(builder.spec_state_indices_tensor[:4] == PAD_SLOT_ID)
 
 
+def test_full_graph_gdn_align_shares_columns_and_keeps_group_slots():
+    batch_spec = BatchSpec(seq_lens=[256, 257], query_lens=[1, 1], name="full_graph_align_decode")
+    common = create_common_attn_metadata(batch_spec=batch_spec, block_size=256, device=torch.device("cpu"))
+    common.num_reqs = 4
+    common.is_prefilling = torch.zeros(4, dtype=torch.bool)
+    columns = {}
+    for offset in (10, 100):
+        builder = _make_builder(
+            device=torch.device("cpu"),
+            num_heads=32,
+            num_speculative_tokens=0,
+            mamba_cache_mode="align",
+            block_size=256,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        )
+        common.block_table_tensor = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32) + offset
+        metadata = builder.build(0, common, num_actual_reqs=2, batch_decode_columns=columns)
+        result = metadata.non_spec_state_indices_tensor
+        assert result.tolist() == [offset + 1, offset + 4, NULL_BLOCK_ID, NULL_BLOCK_ID]
+        assert result.data_ptr() == builder.non_spec_state_indices_tensor.data_ptr()
+        assert metadata.non_spec_query_start_loc.tolist() == [0, 1, 2, 2, 2]
+        assert len(columns) == 1
+        assert columns[(2, 256)].tolist() == [[0], [1]]
+
+
 def test_causal_conv1d_cache_indices_use_device_block_table(monkeypatch: pytest.MonkeyPatch):
     _patch_missing_runtime_cdiv(monkeypatch)
     batch_spec = BatchSpec(
