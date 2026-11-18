@@ -346,6 +346,40 @@ def test_select_moe_comm_method_a3_without_fused_mc2(
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
 
 
+@pytest.mark.parametrize("has_prefill", [None, False, True])
+@pytest.mark.parametrize("num_tokens", [None, 0, 1, 2, 4, 5, 128, 129])
+def test_a3_small_batch_allgather_threshold_is_phase_independent(monkeypatch, has_prefill, num_tokens):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A3, capacity=128)
+    monkeypatch.setattr(
+        afc, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=0, moe_allgather_token_threshold=4)
+    )
+    expected = MoECommType.MC2 if num_tokens is None or num_tokens <= 128 else MoECommType.ALLTOALL
+    if num_tokens is not None and 1 <= num_tokens <= 4:
+        expected = MoECommType.ALLGATHER
+    assert afc.select_moe_comm_method(num_tokens, _make_vllm_config(), has_prefill=has_prefill) == expected
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 5, 129])
+def test_a3_small_batch_allgather_default_keeps_hardware_policy(monkeypatch, num_tokens):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A3, capacity=128)
+    monkeypatch.setattr(
+        afc, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=0, moe_allgather_token_threshold=0)
+    )
+    expected = MoECommType.MC2 if num_tokens <= 128 else MoECommType.ALLTOALL
+    assert afc.select_moe_comm_method(num_tokens, _make_vllm_config()) == expected
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_a3_small_batch_allgather_does_not_override_fused_or_draft_paths(monkeypatch, draft):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A3)
+    fused = 0 if draft else 1
+    monkeypatch.setattr(
+        afc, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=fused, moe_allgather_token_threshold=4)
+    )
+    expected = MoECommType.MC2 if draft else MoECommType.FUSED_MC2
+    assert afc.select_moe_comm_method(1, _make_vllm_config(), is_draft_model=draft) == expected
+
+
 @pytest.mark.parametrize("disable_decode", [False, True])
 @pytest.mark.parametrize("has_prefill", [None, False, True])
 @pytest.mark.parametrize("num_tokens", [1, 128, 4096, 4097, 8192])

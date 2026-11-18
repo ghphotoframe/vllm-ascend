@@ -441,10 +441,21 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         )
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
+        topk_weights = combine_metadata.topk_weights
+        threshold = getattr(get_ascend_config(), "moe_allgather_token_threshold", 0)
+        # The input here is expanded by expert routing. Select precision from
+        # the original full batch, just like the communication selector, so
+        # ranks with different local expert counts still use the same policy.
+        keep_fp32_probs = (
+            threshold > 0
+            and hidden_states.dtype == torch.bfloat16
+            and topk_weights.dtype == torch.float32
+            and 0 < combine_metadata.restore_shape[:-1].numel() <= threshold
+        )
         final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=combine_metadata.expanded_row_idx,
-            probs=combine_metadata.topk_weights.to(hidden_states.dtype),
+            probs=topk_weights if keep_fp32_probs else topk_weights.to(hidden_states.dtype),
         )
         if len(combine_metadata.restore_shape) == 3:
             final_hidden_states = final_hidden_states.view(combine_metadata.restore_shape)

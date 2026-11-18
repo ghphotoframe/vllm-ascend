@@ -744,8 +744,10 @@ class NPUModelRunner(GPUModelRunner):
                 # Also reserve staged decode workspaces before KV allocation;
                 # attention is deliberately absent during memory profiling.
                 # Decode graph candidates cannot exceed max_num_reqs; a raw
-                # capture-size entry above that limit is never captured.
-                decode_tokens = min(profile_max_num_tokens, self.max_num_reqs * self.decode_query_len)
+                # Target verification uses whole queries of 1 + MTP steps.
+                # Neither the scheduler budget nor MC2 capacity must be a
+                # multiple of that width; never round above either limit.
+                decode_tokens = min(self.max_num_tokens, self.max_num_reqs * self.decode_query_len)
                 staged_capacity = get_staged_mc2_tokens_capacity(self.vllm_config)
                 decode_profile_sizes = sorted({min(decode_tokens, staged_capacity), decode_tokens})
                 with (

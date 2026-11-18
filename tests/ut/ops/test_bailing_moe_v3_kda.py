@@ -7,6 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.model_loader.reload.layerwise import _finalize_attention_layer
+from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+from vllm.model_executor.model_loader.reload.utils import get_layer_params_buffers
 from vllm.model_executor.models.bailing_moe_v3 import (
     BailingMoeV3KimiDeltaAttention,
     bailing_v3_kda_attention,
@@ -21,6 +26,8 @@ from tests.ut.ops.test_gdn_attn_builder import (
 from vllm_ascend.ops import kda_state_copy_plan
 from vllm_ascend.ops.bailing_moe_v3_kda import (
     AscendBailingMoeV3KimiDeltaAttention,
+    _contiguous_packed_qkv,
+    _native_decode_prepare_compatible,
     _zero_padded_spec_output,
 )
 
@@ -38,10 +45,12 @@ class _RecordingNorm(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.inputs: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.out: torch.Tensor | None = None
 
-    def forward(self, value: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward_oot(self, value: torch.Tensor, gate: torch.Tensor, *, out: torch.Tensor | None = None) -> torch.Tensor:
         self.inputs = (value, gate)
-        return value
+        self.out = out
+        return value if out is None else out
 
 
 def _new_attention() -> AscendBailingMoeV3KimiDeltaAttention:
@@ -49,6 +58,109 @@ def _new_attention() -> AscendBailingMoeV3KimiDeltaAttention:
     nn.Module.__init__(attention)
     attention._ascend_kda_state_copy = None
     return attention
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_tokens", [1, 4])
+@pytest.mark.parametrize("beta_width", [0, 2], ids=["qkv", "qkvb"])
+def test_packed_qkv_reuses_only_contiguous_projection_storage(dtype, num_tokens, beta_width):
+    width = 3
+    projection = torch.arange(num_tokens * (3 * width + beta_width), dtype=dtype).reshape(num_tokens, -1)
+    q, k, v, _beta = projection.split([width, width, width, beta_width], dim=-1)
+    original = projection.clone()
+    expected = torch.cat((q, k, v), dim=-1)
+    can_alias = num_tokens == 1 or beta_width == 0
+
+    if can_alias:
+        with patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.torch.cat",
+            side_effect=AssertionError("adjacent contiguous slices must not be copied"),
+        ):
+            actual = _contiguous_packed_qkv(q, k, v)
+        assert actual.untyped_storage().data_ptr() == projection.untyped_storage().data_ptr()
+        assert actual.storage_offset() == q.storage_offset()
+    else:
+        with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", wraps=torch.cat) as cat:
+            actual = _contiguous_packed_qkv(q, k, v)
+        cat.assert_called_once()
+        assert actual.untyped_storage().data_ptr() != projection.untyped_storage().data_ptr()
+
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(projection, original, rtol=0, atol=0)
+
+
+def test_packed_qkv_preserves_nonzero_storage_offset():
+    projection = torch.arange(30, dtype=torch.float32).reshape(2, 15)
+    q, k, v = projection[1:2, 2:11].split(3, dim=-1)
+    expected = torch.cat((q, k, v), dim=-1)
+
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.torch.cat",
+        side_effect=AssertionError("the single QKV row is contiguous at its original offset"),
+    ):
+        actual = _contiguous_packed_qkv(q, k, v)
+
+    assert actual.untyped_storage().data_ptr() == projection.untyped_storage().data_ptr()
+    assert actual.storage_offset() == 17
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["separate_storage", "non_adjacent", "strided_columns", "different_dtype"])
+def test_packed_qkv_falls_back_for_unproven_layouts(layout):
+    projection = torch.arange(72, dtype=torch.float32).reshape(2, 36)
+    if layout == "separate_storage":
+        q, k, v = (projection[:, start : start + 3].clone() for start in (0, 3, 6))
+    elif layout == "non_adjacent":
+        q, k, v = (projection[:, start : start + 3] for start in (0, 4, 8))
+    elif layout == "strided_columns":
+        q, k, v = (projection[:, start : start + 6 : 2] for start in (0, 6, 12))
+    else:
+        q, k, v = projection[:, :9].split(3, dim=-1)
+        k = k.to(torch.bfloat16)
+    expected = torch.cat((q, k, v), dim=-1)
+
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", wraps=torch.cat) as cat:
+        actual = _contiguous_packed_qkv(q, k, v)
+
+    cat.assert_called_once()
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_packed_qkv_accepts_empty_graph_token_slices():
+    projection = torch.empty(0, 11)
+    q, k, v, _beta = projection.split([3, 3, 3, 2], dim=-1)
+
+    actual = _contiguous_packed_qkv(q, k, v)
+
+    assert actual.shape == (0, 9)
+    assert actual.dtype == projection.dtype
+    assert actual.is_contiguous()
+
+
+@pytest.mark.parametrize("shared_projection", [False, True], ids=["independent", "packed"])
+def test_packed_qkv_fake_tensors_use_cat_without_storage_pointer_access(shared_projection):
+    with FakeTensorMode():
+        if shared_projection:
+            q, k, v = torch.empty(1, 9, device="cpu").split(3, dim=-1)
+        else:
+            q, k, v = (torch.empty(1, 3, device="cpu") for _ in range(3))
+        with (
+            patch.object(
+                torch.UntypedStorage,
+                "data_ptr",
+                side_effect=AssertionError("FakeTensor storage pointers cannot establish aliasing"),
+            ),
+            patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", wraps=torch.cat) as cat,
+        ):
+            actual = _contiguous_packed_qkv(q, k, v)
+
+    cat.assert_called_once()
+    assert isinstance(actual, FakeTensor)
+    assert actual.shape == (1, 9)
+    assert actual.device == torch.device("cpu")
+    assert actual.dtype == q.dtype
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [0, 1, 7, 8])
@@ -138,6 +250,10 @@ def test_forward_passes_raw_gate_and_backend_beta(separate_b_proj: bool, flash_k
     with (
         patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
         patch.object(torch.ops.vllm, "bailing_v3_kda_attention", create=True) as custom_op,
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.torch.zeros",
+            side_effect=AssertionError("attention result is fully defined by the custom op"),
+        ),
     ):
         result = attention.forward(hidden_states, torch.arange(num_tokens), output)
 
@@ -154,6 +270,8 @@ def test_forward_passes_raw_gate_and_backend_beta(separate_b_proj: bool, flash_k
     assert tuple(core_arg.shape) == (1, num_tokens, num_heads, head_dim)
     assert prefix_arg == attention.prefix
     assert attention.o_norm.inputs is not None
+    assert attention.o_norm.inputs[0] is core_arg
+    assert attention.o_norm.out is core_arg
     torch.testing.assert_close(attention.o_norm.inputs[1], output_gate.reshape(num_tokens, num_heads, head_dim))
 
 
@@ -537,6 +655,61 @@ def test_causal_conv_updates_only_active_cache_rows(layout, cache_dtype, run_mod
     assert state_sd.shape == (9, 3, 6)
 
 
+@pytest.mark.parametrize("speculative_tokens", [0, 3])
+def test_native_single_token_conv_defines_skipped_rows_without_changing_cache_ownership(speculative_tokens):
+    attention = _new_attention()
+    attention._conv_state_dim_first = False
+    attention.num_speculative_tokens = speculative_tokens
+    x = torch.randn(6, 6, dtype=torch.bfloat16)
+    cache = torch.zeros(8, 3, 6, dtype=torch.bfloat16)
+    indices = torch.tensor([2, NULL_BLOCK_ID, 5, PAD_SLOT_ID, 8, 4], dtype=torch.int32)
+    starts = torch.tensor([0, 1, 2, 2, 3, 4, 5], dtype=torch.int32)
+    valid = torch.tensor([True, False, False, False, False, True])
+
+    def prepare(cache_indices, query_start_loc, num_slots, null_block_id, out):
+        assert cache_indices is indices and query_start_loc is starts
+        assert num_slots == 8 and null_block_id == NULL_BLOCK_ID
+        out.fill_(torch.nan)
+        out[~valid] = 0
+        return torch.where(valid, indices, null_block_id)
+
+    def native(input_, state, _weight, **kwargs):
+        assert state is cache and input_ is x
+        assert kwargs["conv_state_indices"].tolist() == [2, 0, 0, 0, 0, 4]
+        out = kwargs["out"]
+        torch.testing.assert_close(out[~valid], torch.zeros_like(out[~valid]), rtol=0, atol=0)
+        if speculative_tokens == 0:
+            assert torch.isnan(out[valid]).all()
+        else:
+            assert torch.count_nonzero(out) == 0
+        out[valid] = input_[valid] + 1
+        state[[2, 4]] += 1
+        return out
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as fused,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native),
+    ):
+        out = attention._run_causal_conv1d(
+            x,
+            torch.empty(4, 6, dtype=x.dtype),
+            cache,
+            starts,
+            indices,
+            None,
+            run_mode=1,
+            max_query_len=1,
+        )
+
+    assert fused.call_count == (1 if speculative_tokens == 0 else 0)
+    expected = torch.zeros_like(x)
+    expected[valid] = x[valid] + 1
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    expected_cache = torch.zeros_like(cache)
+    expected_cache[[2, 4]] = 1
+    torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+
+
 def test_causal_conv_packed_all_null_mrv2_uses_nonnegative_sentinel():
     """FLA update filters only a configured nonnegative null-block ID."""
     attention = _new_attention()
@@ -624,6 +797,47 @@ def test_profile_clears_preallocated_output(metadata):
     assert torch.equal(core_attn_out, torch.zeros_like(core_attn_out))
 
 
+def test_idle_metadata_clears_entire_uninitialized_output(monkeypatch):
+    _patch_missing_runtime_cdiv(monkeypatch)
+    _, _, metadata = _build_attn_metadata(
+        BatchSpec(seq_lens=[10], query_lens=[1]),
+        num_speculative_tokens=0,
+        num_decode_draft_tokens_cpu=None,
+    )
+    metadata.num_actual_tokens = 0
+    metadata.num_prefills = 0
+    metadata.num_decodes = 0
+    attention = SimpleNamespace(
+        prefix="model.layers.0.linear_attn",
+        head_dim=2,
+        kv_cache=(torch.empty(1), torch.empty(1)),
+        _conv_weights_t=MagicMock(return_value=torch.empty(1)),
+        _run_causal_conv1d=MagicMock(),
+        _run_recurrent=MagicMock(),
+        _run_prefill=MagicMock(),
+    )
+    core_attn_out = torch.full((1, 3, 1, 2), torch.nan)
+
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.get_forward_context",
+        return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+    ):
+        AscendBailingMoeV3KimiDeltaAttention._forward(
+            attention,
+            torch.empty(3, 2),
+            torch.empty(3, 2),
+            torch.empty(3, 2),
+            torch.empty(1, 3, 1, 2),
+            torch.empty(1, 3, 1),
+            core_attn_out,
+        )
+
+    assert torch.equal(core_attn_out, torch.zeros_like(core_attn_out))
+    attention._run_causal_conv1d.assert_not_called()
+    attention._run_recurrent.assert_not_called()
+    attention._run_prefill.assert_not_called()
+
+
 def test_spec_padding_discards_unwritten_nan_output():
     output = torch.full((1, 6, 1, 2), torch.nan)
     output[:, :4] = 3
@@ -643,7 +857,10 @@ def test_spec_padding_discards_unwritten_nan_output():
         pytest.param([10, 7, 20], [3, 4, 1], [2, -1, -1], id="spec-prefill-decode"),
     ],
 )
-def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_lens, query_lens, draft_tokens):
+@pytest.mark.parametrize("flash_kda_enabled", [False, True])
+def test_forward_routes_real_builder_metadata_and_clears_tail(
+    monkeypatch, seq_lens, query_lens, draft_tokens, flash_kda_enabled, extra_unassigned_tokens=0
+):
     _patch_missing_runtime_cdiv(monkeypatch)
     num_speculative_tokens = 2 if draft_tokens is not None else 0
     _, _, metadata = _build_attn_metadata(
@@ -651,14 +868,16 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_l
         num_speculative_tokens=num_speculative_tokens,
         num_decode_draft_tokens_cpu=None if draft_tokens is None else torch.tensor(draft_tokens, dtype=torch.int32),
     )
-    num_actual_tokens = sum(query_lens)
+    num_actual_tokens = sum(query_lens) + extra_unassigned_tokens
+    metadata.num_actual_tokens = num_actual_tokens
     num_allocated_tokens = num_actual_tokens + 2
     head_dim = 2
     q = torch.arange(num_allocated_tokens * head_dim, dtype=torch.float32).reshape(-1, head_dim)
     k = q + 100
     v = q + 200
     raw_gate = torch.zeros(1, num_allocated_tokens, 1, head_dim)
-    beta = torch.full((1, num_allocated_tokens, 1), 0.5)
+    beta_logits = torch.linspace(-8, 8, num_allocated_tokens, dtype=torch.bfloat16).reshape(1, -1, 1)
+    beta = beta_logits if flash_kda_enabled else beta_logits.float().sigmoid()
 
     def conv_forward(mixed, _weight, _state, starts, *_args, **_kwargs):
         assert starts[-1] == mixed.shape[0]
@@ -689,9 +908,12 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_l
     )
     core_attn_out = torch.full((1, num_allocated_tokens, 1, head_dim), torch.nan)
 
-    with patch(
-        "vllm_ascend.ops.bailing_moe_v3_kda.get_forward_context",
-        return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+    with (
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.get_forward_context",
+            return_value=SimpleNamespace(attn_metadata={attention.prefix: metadata}),
+        ),
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", flash_kda_enabled),
     ):
         AscendBailingMoeV3KimiDeltaAttention._forward(
             attention,
@@ -724,8 +946,595 @@ def test_forward_routes_real_builder_metadata_and_clears_tail(monkeypatch, seq_l
     assert recurrent.call_count == (metadata.num_decodes > 0 or metadata.spec_sequence_masks is not None)
     assert conv.call_count == (2 if metadata.num_prefills and metadata.spec_sequence_masks is not None else 1)
 
+    expected_beta = beta[:, :num_actual_tokens]
+    if recurrent.called:
+        if metadata.spec_sequence_masks is not None:
+            recurrent_beta = (
+                expected_beta
+                if metadata.num_prefills == 0 and metadata.num_decodes == 0
+                else expected_beta.index_select(1, metadata.spec_token_indx)
+            )
+        else:
+            recurrent_beta = expected_beta[:, : metadata.num_decode_tokens]
+        torch.testing.assert_close(recurrent.call_args.args[4], recurrent_beta, rtol=0, atol=0)
+    if prefill.called:
+        prefill_beta = (
+            expected_beta.index_select(1, metadata.non_spec_token_indx)
+            if metadata.spec_sequence_masks is not None
+            else expected_beta[:, metadata.num_decode_tokens :]
+        )
+        torch.testing.assert_close(prefill.call_args.args[4], prefill_beta, rtol=0, atol=0)
+
     torch.testing.assert_close(core_attn_out, expected)
     torch.testing.assert_close(
         core_attn_out[:, num_actual_tokens:],
         torch.zeros_like(core_attn_out[:, num_actual_tokens:]),
     )
+
+
+@pytest.mark.parametrize("flash_kda_enabled", [False, True])
+def test_mixed_spec_scatter_clears_unassigned_graph_rows(monkeypatch, flash_kda_enabled):
+    # Neither index_copy writes the extra actual-token row. It must be zeroed
+    # before scattering, even though complete single-path copies need no fill.
+    test_forward_routes_real_builder_metadata_and_clears_tail(
+        monkeypatch,
+        seq_lens=[10, 7, 20],
+        query_lens=[3, 4, 1],
+        draft_tokens=[2, -1, -1],
+        flash_kda_enabled=flash_kda_enabled,
+        extra_unassigned_tokens=1,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+@pytest.mark.parametrize("width,gap", [(3, 7), (512, 4), (512, 1040)])
+def test_decode_qkv_compaction_can_defer_generic_adjacent_row_gaps(num_tokens, width, gap):
+    row_stride, offset = 3 * width + gap, 16
+    backing = torch.arange(offset + num_tokens * row_stride, dtype=torch.float32).to(torch.bfloat16)
+    projection = backing.as_strided((num_tokens, 3 * width), (row_stride, 1), offset)
+    q, k, v = projection.chunk(3, dim=-1)
+    expected = torch.cat((q, k, v), dim=-1)
+    original = backing.clone()
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", side_effect=AssertionError("defer safe row-gap cat")):
+        actual = _contiguous_packed_qkv(q, k, v, allow_row_gaps=True)
+    assert actual.stride() == projection.stride()
+    assert actual.storage_offset() == offset
+    assert actual.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    assert actual.is_contiguous() == (num_tokens == 1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(backing, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["state_dtype", "input_dtype", "index_dtype", "starts_dtype", "rows", "starts_shape", "speculative"]
+)
+def test_decode_qkv_defer_guard_rejects_non_native_or_non_fixed_decode(invalid):
+    rows, input_dtype = 2, torch.bfloat16
+    state = torch.empty(8, 3, 12, dtype=torch.bfloat16)
+    indices, starts, speculative = torch.arange(rows, dtype=torch.int32), torch.arange(rows + 1, dtype=torch.int32), 0
+    assert _native_decode_prepare_compatible(rows, input_dtype, state, indices, starts, speculative)
+    if invalid == "state_dtype":
+        state = state.float()
+    elif invalid == "input_dtype":
+        input_dtype = torch.float16
+    elif invalid == "index_dtype":
+        indices = indices.long()
+    elif invalid == "starts_dtype":
+        starts = starts.long()
+    elif invalid == "rows":
+        rows += 1
+    elif invalid == "starts_shape":
+        starts = starts[:-1]
+    else:
+        speculative = 3
+    assert not _native_decode_prepare_compatible(rows, input_dtype, state, indices, starts, speculative)
+
+
+@pytest.mark.parametrize("num_tokens,gap", [(1, 4), (2, 4), (4, 1040)])
+def test_native_single_token_decode_folds_row_gap_pack_into_prepare(num_tokens, gap):
+    attention = _new_attention()
+    attention._conv_state_dim_first = False
+    attention.num_speculative_tokens = 0
+    dim = 12
+    storage = torch.randn(num_tokens, dim + gap, dtype=torch.bfloat16)
+    x = storage[:, :dim]
+    expected = x.clone()
+    state = torch.empty(8, 3, dim, dtype=x.dtype)
+    indices = torch.arange(1, num_tokens + 1, dtype=torch.int32)
+    starts = torch.arange(num_tokens + 1, dtype=torch.int32)
+
+    def prepare(cache_indices, query_start_loc, slots, null, out, **kwargs):
+        assert slots == state.shape[0] and null == NULL_BLOCK_ID
+        assert cache_indices is indices and query_start_loc is starts
+        if num_tokens == 1:
+            assert kwargs == {}
+        else:
+            assert kwargs["input_tensor"] is x
+            assert kwargs["packed_input"].is_contiguous()
+            kwargs["packed_input"].copy_(x)
+        return indices
+
+    def native(input_, cache, _weight, **kwargs):
+        assert cache is state
+        assert input_.is_contiguous()
+        assert (input_ is x) == (num_tokens == 1)
+        torch.testing.assert_close(input_, expected, rtol=0, atol=0)
+        out = kwargs["out"]
+        assert out.is_contiguous()
+        out.copy_(input_)
+        return out
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as prepared,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native) as update,
+    ):
+        actual = attention._run_causal_conv1d(
+            x, torch.empty(4, dim, dtype=x.dtype), state, starts, indices, None, run_mode=1, max_query_len=1
+        )
+    assert prepared.call_count == update.call_count == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class _InputProjectionLinear(nn.Module):
+    def __init__(self, weight):
+        super().__init__()
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.quant_method = UnquantizedLinearMethod()
+        self.bias = None
+        self.gather_output = False
+        self.custom_op = None
+
+    def forward(self, hidden):
+        return torch.nn.functional.linear(hidden, self.weight), None
+
+
+def _input_projection_attention(
+    *,
+    enabled=None,
+    num_speculative_tokens=0,
+    separate_b_proj=False,
+    dtype=torch.bfloat16,
+):
+    projection, heads, hidden = 16, 2, 8
+
+    def fake_base_init(instance, *_args, **_kwargs):
+        nn.Module.__init__(instance)
+        instance.num_speculative_tokens = num_speculative_tokens
+        instance.separate_b_proj = separate_b_proj
+        instance.hidden_size = hidden
+        instance.head_dim = projection // heads
+        instance.local_num_heads = heads
+        instance.projection_size_per_partition = projection
+        instance.model_config = SimpleNamespace(dtype=dtype)
+        instance.prefix = "model.layers.0.linear_attn"
+        instance.conv_size = 4
+        instance.q_conv1d, instance.k_conv1d, instance.v_conv1d = (
+            nn.Module(),
+            nn.Module(),
+            nn.Module(),
+        )
+        for conv in (instance.q_conv1d, instance.k_conv1d, instance.v_conv1d):
+            conv.weight = nn.Parameter(torch.ones(projection, 1, 4), requires_grad=False)
+        qkvb = torch.cat(
+            [torch.full((projection, hidden), value, dtype=dtype) for value in (1.0, 2.0, 3.0)]
+            + [torch.full((heads, hidden), 4.0, dtype=dtype)],
+            dim=0,
+        )
+        instance.qkvb_proj = _InputProjectionLinear(qkvb)
+        instance.f_proj = _InputProjectionLinear(torch.full((projection, hidden), 5.0, dtype=dtype))
+        instance.g_proj = _InputProjectionLinear(torch.full((projection, hidden), 6.0, dtype=dtype))
+        instance.o_proj = _InputProjectionLinear(torch.ones(hidden, projection, dtype=dtype))
+        instance.o_norm = _RecordingNorm()
+
+    config = SimpleNamespace() if enabled is None else SimpleNamespace(fuse_kda_input_projections=enabled)
+    with (
+        patch.object(BailingMoeV3KimiDeltaAttention, "__init__", fake_base_init),
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda.is_conv_state_dim_first",
+            return_value=False,
+        ),
+    ):
+        return AscendBailingMoeV3KimiDeltaAttention(config)
+
+
+def test_input_projection_fusion_default_keeps_canonical_parameters_without_new_buffer():
+    attention = _input_projection_attention()
+    assert attention._ascend_fuse_input_projections is False
+    assert "ascend_input_projection_weight" not in attention._buffers
+    assert "qkvb_proj.weight" in dict(attention.named_parameters())
+    assert "f_proj.weight" in dict(attention.named_parameters())
+    assert "g_proj.weight" in dict(attention.named_parameters())
+
+
+@pytest.mark.parametrize("unsupported", ["mtp", "separate_beta", "fp32", "non_boolean"])
+def test_input_projection_fusion_rejects_unsupported_checkpoint_contracts(unsupported):
+    args = dict(enabled=True)
+    if unsupported == "mtp":
+        args["num_speculative_tokens"] = 1
+    elif unsupported == "separate_beta":
+        args["separate_b_proj"] = True
+    elif unsupported == "fp32":
+        args["dtype"] = torch.float32
+    else:
+        args["enabled"] = "true"
+    with pytest.raises(ValueError, match="KDA|fuse_kda_input_projections"):
+        _input_projection_attention(**args)
+
+
+@pytest.mark.parametrize("unsupported", ["quantized", "bias", "gather", "custom_parallel_op", "model_dtype"])
+def test_input_projection_fusion_does_not_bypass_linear_semantics(unsupported):
+    attention = _input_projection_attention(enabled=True)
+    if unsupported == "quantized":
+        attention.f_proj.quant_method = object()
+    elif unsupported == "bias":
+        attention.f_proj.bias = nn.Parameter(torch.zeros(16, dtype=torch.bfloat16), requires_grad=False)
+    elif unsupported == "gather":
+        attention.f_proj.gather_output = True
+    elif unsupported == "custom_parallel_op":
+        attention.f_proj.custom_op = object()
+    else:
+        attention.model_config.dtype = torch.float32
+    with pytest.raises(ValueError, match="BF16"):
+        attention._pack_input_projection_weights()
+
+
+def test_input_projection_pack_order_keeps_beta_after_aligned_qkv_and_gates():
+    attention = _input_projection_attention(enabled=True)
+    assert attention.get_buffer("ascend_input_projection_weight") is None
+    attention._pack_input_projection_weights()
+    weight = attention.get_buffer("ascend_input_projection_weight")
+    # Tagged canonical rows Q/K/V/B/F/G = 1/2/3/4/5/6 must become Q/K/V/F/G/B.
+    sections = weight.split((16, 16, 16, 16, 16, 2, 14), dim=0)
+    for section, expected in zip(sections, (1, 2, 3, 5, 6, 4, 0)):
+        torch.testing.assert_close(section, torch.full_like(section, expected), rtol=0, atol=0)
+    assert weight.shape == (96, 8)
+    assert "ascend_input_projection_weight" in attention._non_persistent_buffers_set
+    assert "ascend_input_projection_weight" not in attention.state_dict()
+    assert "ascend_input_projection_weight" not in dict(attention.named_parameters())
+
+
+def test_input_projection_refit_refreshes_values_without_replacing_captured_storage():
+    attention = _input_projection_attention(enabled=True)
+    attention._pack_input_projection_weights()
+    weight = attention.get_buffer("ascend_input_projection_weight")
+    pointer = weight.data_ptr()
+    canonical_parameters = {name: id(parameter) for name, parameter in attention.named_parameters()}
+    attention.f_proj.weight.fill_(7)
+    attention.g_proj.weight.fill_(8)
+    attention.qkvb_proj.weight[-2:].fill_(9)
+    attention._pack_input_projection_weights()
+    assert attention.get_buffer("ascend_input_projection_weight") is weight
+    assert weight.data_ptr() == pointer
+    assert {name: id(parameter) for name, parameter in attention.named_parameters()} == canonical_parameters
+    for section, expected in zip(weight.split((48, 16, 16, 2, 14), dim=0)[1:], (7, 8, 9, 0)):
+        torch.testing.assert_close(section, torch.full_like(section, expected), rtol=0, atol=0)
+    assert attention._ascend_input_projection_ready is True
+
+
+@pytest.mark.parametrize("changed", ["shape", "dtype", "device", "format"])
+def test_input_projection_refit_rejects_runtime_buffer_contract_changes(changed):
+    attention = _input_projection_attention(enabled=True)
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda._input_projection_weight_format",
+        return_value=2,
+    ):
+        attention._pack_input_projection_weights()
+    weight = attention.get_buffer("ascend_input_projection_weight")
+    replacement = weight
+    if changed == "shape":
+        replacement = torch.empty((97, 8), dtype=weight.dtype)
+    elif changed == "dtype":
+        replacement = weight.float()
+    elif changed == "device":
+        replacement = torch.empty(weight.shape, device="meta", dtype=weight.dtype)
+    attention.register_buffer("ascend_input_projection_weight", replacement, persistent=False)
+    with (
+        patch(
+            "vllm_ascend.ops.bailing_moe_v3_kda._input_projection_weight_format",
+            return_value=29 if changed == "format" else 2,
+        ),
+        pytest.raises(RuntimeError, match="cannot change after initialization"),
+    ):
+        attention._pack_input_projection_weights()
+    assert attention._ascend_input_projection_ready is False
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 4, 5, 8, 128, 8192])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_input_projection_forward_uses_the_configured_path_for_all_token_rows(tokens, enabled):
+    attention = _input_projection_attention(enabled=enabled)
+    if enabled:
+        attention._pack_input_projection_weights()
+    hidden = torch.full((tokens, 8), 0.125, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden)
+    calls = []
+    hooks = [
+        layer.register_forward_hook(lambda _module, _args, _output, name=name: calls.append(name))
+        for name, layer in (
+            ("qkvb", attention.qkvb_proj),
+            ("f", attention.f_proj),
+            ("g", attention.g_proj),
+        )
+    ]
+
+    def attention_call(q, k, v, gate, beta, core, _prefix):
+        core.zero_()
+        for value, expected in zip(
+            (q, k, v, gate, beta),
+            (1.0, 2.0, 3.0, 5.0, torch.sigmoid(torch.tensor(4.0)).item()),
+        ):
+            torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
+
+    try:
+        with (
+            patch("vllm_ascend.ops.bailing_moe_v3_kda.FLASH_KDA_ENABLED", False),
+            patch(
+                "vllm_ascend.ops.bailing_moe_v3_kda.torch.ops.vllm.unquantized_gemm",
+                side_effect=torch.nn.functional.linear,
+                create=True,
+            ) as gemm,
+            patch(
+                "vllm_ascend.ops.bailing_moe_v3_kda.torch.ops.vllm.bailing_v3_kda_attention",
+                side_effect=attention_call,
+            ),
+        ):
+            attention.forward(hidden, torch.empty(tokens), output)
+        output_gate = attention.o_norm.inputs[1]
+        torch.testing.assert_close(output_gate, torch.full_like(output_gate, 6.0), rtol=0, atol=0)
+        if enabled:
+            gemm.assert_called_once()
+            assert calls == []
+        else:
+            gemm.assert_not_called()
+            assert calls == ["qkvb", "f", "g"]
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+def test_input_projection_requires_refit_postload_before_small_batch_forward():
+    attention = _input_projection_attention(enabled=True)
+    with pytest.raises(RuntimeError, match="deferred post-load/refit"):
+        attention._run_fused_input_projection(torch.ones(1, 8, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("backend", ["hccl", "npu_ipc", "nccl", "sparse_nccl"])
+def test_input_projection_fusion_requires_postload_refreshing_weight_updates(backend):
+    config = SimpleNamespace(weight_transfer_config=SimpleNamespace(backend=backend))
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.get_current_vllm_config_or_none",
+        return_value=config,
+    ):
+        if backend == "sparse_nccl":
+            with pytest.raises(ValueError, match="sparse_nccl"):
+                _input_projection_attention(enabled=True)
+            # The opt-in restriction must not affect the default model path.
+            assert _input_projection_attention()._ascend_fuse_input_projections is False
+        else:
+            _input_projection_attention(enabled=True)
+
+
+def test_input_projection_real_deferred_finalize_restores_and_refreshes_captured_buffers():
+    attention = _input_projection_attention(enabled=True)
+    attention.process_weights_after_loading(torch.bfloat16)
+    captured = get_layer_params_buffers(attention)
+    conv = attention.get_buffer("ascend_conv1d_weight")
+    projection = attention.get_buffer("ascend_input_projection_weight")
+    original_pointers = (conv.data_ptr(), projection.data_ptr())
+    canonical_ids = {name: id(parameter) for name, parameter in attention.named_parameters()}
+    for order, values in (("fg", (7, 8, 9)), ("gf", (10, 11, 12))):
+        f_value, g_value, b_value = values
+        for name in order:
+            getattr(attention, name + "_proj").weight.fill_(f_value if name == "f" else g_value)
+        attention.qkvb_proj.weight[-2:].fill_(b_value)
+        # RL restore may delete the derived buffers, but finalize must restore
+        # their captured storage before this parent's post-load repacks them.
+        delattr(attention, "ascend_input_projection_weight")
+        delattr(attention, "ascend_conv1d_weight")
+        info = LayerReloadingInfo(
+            restore_metadata=({}, {}),
+            restore_device=torch.device("cpu"),
+            kernel_tensors=captured,
+            kernel_non_persistent_buffers={"ascend_conv1d_weight", "ascend_input_projection_weight"},
+        )
+        _finalize_attention_layer(attention, info, SimpleNamespace(dtype=torch.bfloat16))
+        assert attention.get_buffer("ascend_conv1d_weight") is conv
+        assert attention.get_buffer("ascend_input_projection_weight") is projection
+        assert (conv.data_ptr(), projection.data_ptr()) == original_pointers
+        assert {name: id(parameter) for name, parameter in attention.named_parameters()} == canonical_ids
+        for section, expected in zip(projection.split((48, 16, 16, 2, 14), dim=0)[1:], (*values, 0)):
+            torch.testing.assert_close(section, torch.full_like(section, expected), rtol=0, atol=0)
+        assert attention._ascend_input_projection_ready
+        assert attention._ascend_conv_weights_ready
+        assert {"ascend_conv1d_weight", "ascend_input_projection_weight"} <= attention._non_persistent_buffers_set
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+def test_fused_projection_uses_j_native_prepare_without_qkv_cat_or_gate_mutation(num_tokens):
+    attention = _input_projection_attention(enabled=True)
+    attention._pack_input_projection_weights()
+    hidden = torch.full((num_tokens, attention.hidden_size), 0.125, dtype=torch.bfloat16)
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.torch.ops.vllm.unquantized_gemm",
+        side_effect=torch.nn.functional.linear,
+        create=True,
+    ):
+        qkv, f_values, g_values, beta = attention._run_fused_input_projection(hidden)
+    q, k, v = qkv.chunk(3, dim=-1)
+    with patch("vllm_ascend.ops.bailing_moe_v3_kda.torch.cat", side_effect=AssertionError("unexpected QKV cat")):
+        mixed = _contiguous_packed_qkv(q, k, v, allow_row_gaps=True)
+    assert mixed.data_ptr() == qkv.data_ptr()
+    assert mixed.stride() == qkv.stride()
+    assert mixed.is_contiguous() == (num_tokens == 1)
+    before = [value.clone() for value in (qkv, f_values, g_values, beta)]
+    channels = qkv.shape[1]
+    state = torch.empty(num_tokens + 2, 3, channels, dtype=torch.bfloat16)
+    indices = torch.arange(1, num_tokens + 1, dtype=torch.int32)
+    starts = torch.arange(num_tokens + 1, dtype=torch.int32)
+
+    def prepare(_indices, _starts, _slots, _null, _output, **kwargs):
+        if num_tokens == 1:
+            assert kwargs == {}
+        else:
+            assert kwargs["input_tensor"] is mixed
+            assert kwargs["packed_input"].is_contiguous()
+            kwargs["packed_input"].copy_(mixed)
+        return indices
+
+    def native(value, _state, _weight, **kwargs):
+        assert value.is_contiguous()
+        torch.testing.assert_close(value, before[0], rtol=0, atol=0)
+        kwargs["out"].copy_(value)
+        return kwargs["out"]
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as prepared,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native) as update,
+    ):
+        actual = attention._run_causal_conv1d(
+            mixed,
+            torch.empty(4, channels, dtype=torch.bfloat16),
+            state,
+            starts,
+            indices,
+            None,
+            run_mode=1,
+            max_query_len=1,
+        )
+    assert prepared.call_count == update.call_count == 1
+    torch.testing.assert_close(actual, before[0], rtol=0, atol=0)
+    for value, expected in zip((qkv, f_values, g_values, beta), before):
+        torch.testing.assert_close(value, expected, rtol=0, atol=0)
+
+
+def test_input_projection_fusion_rejects_lora_without_changing_the_default_path():
+    config = SimpleNamespace(lora_config=SimpleNamespace(max_lora_rank=16))
+    with patch(
+        "vllm_ascend.ops.bailing_moe_v3_kda.get_current_vllm_config_or_none",
+        return_value=config,
+    ):
+        with pytest.raises(ValueError, match="LoRA"):
+            _input_projection_attention(enabled=True)
+        attention = _input_projection_attention()
+        assert attention._ascend_fuse_input_projections is False
+        assert "ascend_input_projection_weight" not in attention._buffers
+
+
+def _raw_gate_native_decode_case():
+    attention = _new_attention()
+    attention._conv_state_dim_first = False
+    attention.num_speculative_tokens = 0
+    rows, width, stride = 2, 4, 28
+    storage = torch.arange(rows * stride, dtype=torch.float32).bfloat16()
+    qkv = storage.as_strided((rows, 3 * width), (stride, 1))
+    gate = storage.as_strided((1, rows, 2, 2), (rows * stride, stride, 2, 1), 3 * width)
+    values = dict(
+        mixed_qkv=qkv,
+        conv_weights_t=torch.empty(4, 3 * width, dtype=torch.bfloat16),
+        conv_state_storage=torch.empty(8, 3, 3 * width, dtype=torch.bfloat16),
+        query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+        cache_indices=torch.arange(1, rows + 1, dtype=torch.int32),
+        initial_state_mode=None,
+        run_mode=1,
+        max_query_len=1,
+        gate_tensor=gate,
+        packed_gate=torch.empty_like(gate, memory_format=torch.contiguous_format),
+    )
+    return attention, values
+
+
+def test_native_decode_gate_pack_uses_zero_copy_2d_metadata_views_and_dense_gate():
+    attention, values = _raw_gate_native_decode_case()
+    source_gate, target_gate = values["gate_tensor"], values["packed_gate"]
+    source_before = values["mixed_qkv"].untyped_storage().clone()
+
+    def prepare(indices, starts, slots, null, output, **options):
+        assert slots == 8 and null == NULL_BLOCK_ID
+        assert indices is values["cache_indices"] and starts is values["query_start_loc"]
+        gate, packed = options["gate_tensor"], options["packed_gate"]
+        assert gate.shape == packed.shape == (2, 4)
+        assert gate.data_ptr() == source_gate.data_ptr()
+        assert gate.storage_offset() == source_gate.storage_offset()
+        assert gate.stride() == (28, 1)
+        assert packed.data_ptr() == target_gate.data_ptr() and packed.is_contiguous()
+        assert gate.untyped_storage().data_ptr() == options["input_tensor"].untyped_storage().data_ptr()
+        options["packed_input"].copy_(options["input_tensor"])
+        packed.copy_(gate)
+        return indices
+
+    def native(input_, state, _weights, **options):
+        assert input_.is_contiguous() and state is values["conv_state_storage"]
+        torch.testing.assert_close(target_gate, source_gate, rtol=0, atol=0)
+        options["out"].copy_(input_)
+        return options["out"]
+
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode", side_effect=prepare) as prepared,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update", side_effect=native) as update,
+    ):
+        actual = attention._run_causal_conv1d(**values)
+    assert prepared.call_count == update.call_count == 1
+    torch.testing.assert_close(actual, values["mixed_qkv"], rtol=0, atol=0)
+    assert list(values["mixed_qkv"].untyped_storage()) == list(source_before)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "state_dtype",
+        "index_dtype",
+        "starts_dtype",
+        "run_mode",
+        "max_query",
+        "accepted",
+        "spec",
+        "contiguous",
+        "gate_shape",
+        "state_alias",
+        "indices_alias",
+        "starts_alias",
+    ],
+)
+def test_native_decode_gate_pack_rejects_unsupported_cases_before_state_or_native_updates(invalid):
+    attention, values = _raw_gate_native_decode_case()
+    if invalid == "state_dtype":
+        values["conv_state_storage"] = values["conv_state_storage"].float()
+    elif invalid == "index_dtype":
+        values["cache_indices"] = values["cache_indices"].long()
+    elif invalid == "starts_dtype":
+        values["query_start_loc"] = values["query_start_loc"].long()
+    elif invalid == "run_mode":
+        values["run_mode"] = 0
+    elif invalid == "max_query":
+        values["max_query_len"] = 2
+    elif invalid == "accepted":
+        values["num_accepted_tokens"] = torch.ones(2, dtype=torch.int32)
+    elif invalid == "spec":
+        attention.num_speculative_tokens = 1
+    elif invalid == "contiguous":
+        values["mixed_qkv"] = values["mixed_qkv"].contiguous()
+    elif invalid == "gate_shape":
+        values["gate_tensor"] = values["gate_tensor"][0]
+    elif invalid == "state_alias":
+        values["packed_gate"] = values["conv_state_storage"].view(-1)[:8].view(1, 2, 2, 2)
+    else:
+        key = "cache_indices" if invalid == "indices_alias" else "query_start_loc"
+        backing = torch.empty(16, dtype=torch.int32)
+        original = values[key]
+        values[key] = backing[: original.numel()]
+        values[key].copy_(original)
+        values["packed_gate"] = backing.view(torch.bfloat16)[:8].view(1, 2, 2, 2)
+    state_before = values["conv_state_storage"].clone()
+    with (
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.prepare_native_conv_decode") as prepared,
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.copy_conv_state") as copy,
+        patch("vllm_ascend.ops.bailing_moe_v3_kda.gather_update_conv_state") as gather,
+        patch("vllm_ascend.ops.kda_conv.causal_conv1d_update") as native,
+        pytest.raises(ValueError),
+    ):
+        attention._run_causal_conv1d(**values)
+    prepared.assert_not_called()
+    copy.assert_not_called()
+    gather.assert_not_called()
+    native.assert_not_called()
+    torch.testing.assert_close(values["conv_state_storage"], state_before, rtol=0, atol=0, equal_nan=True)

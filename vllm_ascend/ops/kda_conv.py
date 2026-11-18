@@ -45,6 +45,45 @@ def native_conv_state_supported(state: torch.Tensor, input_dtype: torch.dtype) -
     )
 
 
+def prepare_native_conv_decode(
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_slots: int,
+    null_block_id: int,
+    output: torch.Tensor,
+    *,
+    input_tensor: torch.Tensor | None = None,
+    packed_input: torch.Tensor | None = None,
+    gate_tensor: torch.Tensor | None = None,
+    packed_gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Prepare native fixed decode, optionally compacting a row-gap input."""
+    from vllm_ascend.ops.triton.kda.conv_state import (
+        prepare_native_conv_decode as prepare,
+    )
+
+    gate_options = (
+        {}
+        if gate_tensor is None and packed_gate is None
+        else {
+            "gate_tensor": gate_tensor,
+            "packed_gate": packed_gate,
+        }
+    )
+    if input_tensor is None and packed_input is None and not gate_options:
+        return prepare(cache_indices, query_start_loc, num_slots, null_block_id, output)
+    return prepare(
+        cache_indices,
+        query_start_loc,
+        num_slots,
+        null_block_id,
+        output,
+        input_tensor=input_tensor,
+        packed_input=packed_input,
+        **gate_options,
+    )
+
+
 def run_causal_conv1d(
     mixed_qkv: torch.Tensor,
     conv_weights_t: torch.Tensor,

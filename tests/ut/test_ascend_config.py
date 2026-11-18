@@ -2530,3 +2530,133 @@ class TestEngramSharedMemoryDefaults(TestBase):
         config.engram_config = None
         AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).derive_and_validate(config)
         self.assertIsNone(config.engram_config)
+
+
+class TestMoeAllGatherTokenThresholdConfig(TestBase):
+    @staticmethod
+    def _policy(threshold=4, fused=0):
+        config = object.__new__(AscendConfig)
+        config.moe_allgather_token_threshold = threshold
+        config.enable_fused_mc2 = fused
+        return config
+
+    @staticmethod
+    def _make_config():
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_moe=True,
+                dtype=torch.bfloat16,
+                hf_text_config=SimpleNamespace(hidden_size=2560, moe_intermediate_size=768),
+            ),
+            parallel_config=SimpleNamespace(
+                enable_expert_parallel=True,
+                tensor_parallel_size=8,
+                data_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=2,
+                use_sequence_parallel_moe=False,
+                expert_placement_strategy="linear",
+            ),
+            quant_config=None,
+            use_v2_model_runner=True,
+            lora_config=None,
+            speculative_config=None,
+        )
+
+    def test_default_and_nonnegative_user_range(self):
+        for threshold in (0, 1, 4, 128, "4"):
+            with self.subTest(threshold=threshold):
+                config = AscendConfig(
+                    sparse_kv_offload_config=SimpleNamespace(enabled=False), moe_allgather_token_threshold=threshold
+                )
+                self.assertEqual(config.moe_allgather_token_threshold, int(threshold))
+        default = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False))
+        self.assertEqual(default.moe_allgather_token_threshold, 0)
+        with self.assertRaises(ValueError):
+            AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), moe_allgather_token_threshold=-1)
+        self._policy(0)._validate_moe_allgather_token_threshold(SimpleNamespace())
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A3)
+    )
+    def test_supported_bf16_and_float_metadata_keep_dcp2(self, _profile):
+        config = self._make_config()
+        self.assertEqual(VllmConfig().parallel_config.expert_placement_strategy, "linear")
+        self._policy()._validate_moe_allgather_token_threshold(config)
+        config.quant_config = SimpleNamespace(
+            quant_description={"model.layers.0.mlp.experts.0.gate_proj.weight": "FLOAT"}
+        )
+        self._policy()._validate_moe_allgather_token_threshold(config)
+        self.assertEqual(config.parallel_config.decode_context_parallel_size, 2)
+
+    def test_other_hardware_is_explicitly_rejected(self):
+        for device in (AscendDeviceType.A2, AscendDeviceType.A5, AscendDeviceType._310P):
+            with (
+                self.subTest(device=device),
+                patch(
+                    "vllm_ascend.ascend_config.get_current_hardware_profile", return_value=get_hardware_profile(device)
+                ),
+                self.assertRaisesRegex(ValueError, "supports only A3"),
+            ):
+                self._policy()._validate_moe_allgather_token_threshold(self._make_config())
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A3)
+    )
+    def test_unsupported_parallel_runtime_and_adapter_conditions_fail(self, _profile):
+        changes = (
+            ("use_v2_model_runner", False, "Model Runner V2"),
+            ("model_config.is_moe", False, "MoE model"),
+            ("parallel_config.enable_expert_parallel", False, "expert parallelism"),
+            ("parallel_config.tensor_parallel_size", 1, "TP>1"),
+            ("parallel_config.data_parallel_size", 2, "DP1 and PCP1"),
+            ("parallel_config.prefill_context_parallel_size", 2, "DP1 and PCP1"),
+            ("parallel_config.use_sequence_parallel_moe", True, "replicated token inputs"),
+            ("parallel_config.expert_placement_strategy", "round_robin", "linear expert placement"),
+            ("lora_config", SimpleNamespace(), "LoRA or speculative"),
+            ("speculative_config", SimpleNamespace(), "LoRA or speculative"),
+        )
+        for path, value, message in changes:
+            config = self._make_config()
+            owner = config
+            parts = path.split(".")
+            for part in parts[:-1]:
+                owner = getattr(owner, part)
+            setattr(owner, parts[-1], value)
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, message):
+                self._policy()._validate_moe_allgather_token_threshold(config)
+        with self.assertRaisesRegex(ValueError, "enable_fused_mc2=0"):
+            self._policy(fused=1)._validate_moe_allgather_token_threshold(self._make_config())
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A3)
+    )
+    def test_quantized_or_non_bf16_experts_are_rejected(self, _profile):
+        for kind in ("fp16", "hf_quantize", "hf_moe_quantize", "unknown_metadata", "quantized_expert"):
+            config = self._make_config()
+            if kind == "fp16":
+                config.model_config.dtype = torch.float16
+            elif kind.startswith("hf_"):
+                setattr(config.model_config.hf_text_config, kind[3:], "w4a8")
+            elif kind == "unknown_metadata":
+                config.quant_config = SimpleNamespace()
+            else:
+                config.quant_config = SimpleNamespace(
+                    quant_description={"model.layers.0.mlp.experts.0.gate_proj.weight": "W8A8_DYNAMIC"}
+                )
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "BF16 unquantized"):
+                self._policy()._validate_moe_allgather_token_threshold(config)
+
+    @patch(
+        "vllm_ascend.ascend_config.get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A3)
+    )
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_factory_calls_cross_config_validation(self, _platform, _profile):
+        clear_ascend_config()
+        try:
+            config = VllmConfig()
+            config.additional_config = {"moe_allgather_token_threshold": 4}
+            with self.assertRaisesRegex(ValueError, "requires a MoE model"):
+                init_ascend_config(config)
+        finally:
+            clear_ascend_config()
