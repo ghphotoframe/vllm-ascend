@@ -82,12 +82,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Retain CPU sequence boundaries for Bailing eager vision FIA on Ascend.
+    # Default: 0; valid: 0 or 1. Not sensitive. Set before worker startup.
+    "VLLM_ASCEND_KEEP_BAILING_VIT_CU_SEQLENS_CPU": lambda: _strict_binary_env(
+        "VLLM_ASCEND_KEEP_BAILING_VIT_CU_SEQLENS_CPU"
+    ),
     # Opt in to PyPTO FlashKDA for Bailing/Ling V3 prefill on A5 only.
     # Default: 0 (AscendC chunk KDA); valid values: 0 or 1. Not sensitive.
     # Selected at module import; set before starting workers and restart to
     # change it. Requires the external FlashKDA V1/PyPTO package. A2/A3/310P
     # reject explicit enablement. Kimi/GLM and recurrent KDA are unaffected.
     "VLLM_ASCEND_ENABLE_FLASH_KDA": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_KDA"),
+    # Pad adjacent vision Q/K views together in the eager CANN path.
+    # Default: 0; valid: 0 or 1. Not sensitive.
+    "VLLM_ASCEND_FUSE_VIT_QK_PADDING": lambda: _strict_binary_env("VLLM_ASCEND_FUSE_VIT_QK_PADDING"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

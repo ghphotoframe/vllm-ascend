@@ -97,6 +97,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -406,6 +407,7 @@ def build_attn_metadata(
     pcp_context: "AscendPCPAttentionContext | None" = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
+    share_gdn_decode_columns: bool = False,
     causal: bool | Mapping[int, bool] = True,
     full_graph_mode: bool = False,
     skip_ring_state_update: bool | None = None,
@@ -471,6 +473,7 @@ def build_attn_metadata(
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
+    batch_decode_columns: dict[tuple[int, int], torch.Tensor] | None = {} if share_gdn_decode_columns else None
     kv_cache_groups = kv_cache_config.kv_cache_groups
     batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
     formatted_slot_mappings = None
@@ -622,6 +625,11 @@ def build_attn_metadata(
                 else:
                     if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
                         attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
+                    if (
+                        batch_decode_columns is not None
+                        and type(attn_metadata_builder) is AscendGDNAttentionMetadataBuilder
+                    ):
+                        attn_metadata_extra_kwargs["batch_decode_columns"] = batch_decode_columns
                     metadata = attn_metadata_builder.build(
                         common_prefix_len=0,
                         common_attn_metadata=variant_common,

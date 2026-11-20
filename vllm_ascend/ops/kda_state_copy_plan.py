@@ -13,10 +13,11 @@ from collections.abc import Mapping
 from contextlib import nullcontext
 from copy import copy
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
-from vllm.forward_context import get_forward_context
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.triton.batch_memcpy import batch_memcpy_kernel
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 
 
 _FALLBACK_COPY_BLOCK_SIZE = 8192
+_FALLBACK_COPY_OFFSETS_KEY = "ascend_kda_prefill_fallback_copy_offsets"
 
 
 def supports_kda_state_copy(state: torch.Tensor) -> bool:
@@ -244,6 +246,14 @@ class KDAStateCopyPlan:
         self._launch(state, packed, indices, None, to_cache=True)
 
 
+class _FallbackCopyOffsets(NamedTuple):
+    # Keep the index tensor alive for the lifetime of its identity-based key.
+    indices: torch.Tensor
+    cache_offsets: torch.Tensor
+    packed_offsets: torch.Tensor
+    sizes: torch.Tensor
+
+
 class StridedKDAFallbackPlan:
     """PR #17301 byte-copy fallback, compiled once on disposable startup data.
 
@@ -305,7 +315,32 @@ class StridedKDAFallbackPlan:
             raise RuntimeError("KDA fallback configuration/hooks changed during preparation")
         self._sealed = True
 
-    def _copy(self, state, packed, indices, *, to_cache):
+    def _build_offsets(self, state: torch.Tensor, indices: torch.Tensor) -> _FallbackCopyOffsets:
+        index64 = indices.to(torch.int64)
+        valid = (index64 >= 0) & (index64 < state.shape[0])
+        cache_offsets = index64.clamp(0, state.shape[0] - 1) * (state.stride(0) * state.element_size())
+        packed_offsets = torch.arange(indices.numel(), device=state.device, dtype=torch.int64) * self._state_bytes
+        sizes = valid.to(torch.int64) * self._state_bytes
+        return _FallbackCopyOffsets(indices, cache_offsets, packed_offsets, sizes)
+
+    def _get_reusable_offsets(self, state: torch.Tensor, indices: torch.Tensor) -> _FallbackCopyOffsets | None:
+        if not is_forward_context_available():
+            return None
+        context = get_forward_context()
+        if context.cudagraph_runtime_mode is not CUDAGraphMode.NONE or context.ubatch_slices is not None:
+            return None
+        # The caller opts in only for read-only, unfiltered batch indices.
+        # Keep cached tensors private to the current forward and stream.
+        stream = torch.npu.current_stream(state.device).npu_stream
+        key = (id(indices), self._signature, stream)
+        cache = context.additional_kwargs.setdefault(_FALLBACK_COPY_OFFSETS_KEY, {})
+        offsets = cache.get(key)
+        if offsets is None:
+            offsets = self._build_offsets(state, indices)
+            cache[key] = offsets
+        return offsets
+
+    def _copy(self, state, packed, indices, *, to_cache, reuse_offsets: bool = False):
         """Build byte-pointer vectors as the PR does and use a compiled launch."""
         if not self._sealed or cache_signature(state) != self._signature:
             raise RuntimeError("unprepared KDA fallback cache layout")
@@ -320,13 +355,21 @@ class StridedKDAFallbackPlan:
             raise ValueError("KDA fallback packed shape/device mismatch")
         if not count:
             return
-        indices = indices.to(torch.int64)
-        valid = (indices >= 0) & (indices < state.shape[0])
-        cache_ptrs = state.data_ptr() + indices.clamp(0, state.shape[0] - 1) * (state.stride(0) * state.element_size())
-        packed_ptrs = (
-            packed.data_ptr() + torch.arange(count, device=state.device, dtype=torch.int64) * self._state_bytes
-        )
-        sizes = valid.to(torch.int64) * self._state_bytes
+        offsets = self._get_reusable_offsets(state, indices) if reuse_offsets else None
+        if offsets is None:
+            indices = indices.to(torch.int64)
+            valid = (indices >= 0) & (indices < state.shape[0])
+            cache_ptrs = state.data_ptr() + indices.clamp(0, state.shape[0] - 1) * (
+                state.stride(0) * state.element_size()
+            )
+            packed_ptrs = (
+                packed.data_ptr() + torch.arange(count, device=state.device, dtype=torch.int64) * self._state_bytes
+            )
+            sizes = valid.to(torch.int64) * self._state_bytes
+        else:
+            cache_ptrs = state.data_ptr() + offsets.cache_offsets
+            packed_ptrs = packed.data_ptr() + offsets.packed_offsets
+            sizes = offsets.sizes
         if to_cache:
             src, dst = packed_ptrs, cache_ptrs
         else:
@@ -335,7 +378,7 @@ class StridedKDAFallbackPlan:
         with torch.npu.device(state.device):
             self._compiled[(count, 1, 1)](src, dst, sizes, *self._launch_constants)
 
-    def gather(self, state, indices, flags):
+    def gather(self, state, indices, flags, *, reuse_offsets: bool = False):
         """Gather valid rows and clear false flags without any serving JIT."""
         if torch.compiler.is_compiling():
             return torch.ops.vllm.kda_state_gather(state, indices, flags, self._layer_name)
@@ -344,18 +387,18 @@ class StridedKDAFallbackPlan:
             if flags.numel() != indices.numel():
                 raise ValueError("KDA fallback flags must match selected count")
         packed = torch.empty((indices.numel(), *state.shape[1:]), dtype=state.dtype, device=state.device)
-        self._copy(state, packed, indices, to_cache=False)
+        self._copy(state, packed, indices, to_cache=False, reuse_offsets=reuse_offsets)
         if flags is not None:
             packed.masked_fill_(~flags[:, None, None, None], 0)
         return packed
 
-    def scatter(self, state, packed, indices):
+    def scatter(self, state, packed, indices, *, reuse_offsets: bool = False):
         """Cast/contiguize final states and preserve untouched cache pages."""
         if torch.compiler.is_compiling():
             torch.ops.vllm.kda_state_scatter(state, packed, indices, self._layer_name)
             return
         packed = packed.to(dtype=state.dtype).contiguous()
-        self._copy(state, packed, indices, to_cache=True)
+        self._copy(state, packed, indices, to_cache=True, reuse_offsets=reuse_offsets)
 
 
 def initialize_kda_state_copy(static_forward_context: dict, max_selected: int) -> None:

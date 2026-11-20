@@ -28,8 +28,10 @@ import einops
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.logger import logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
+from vllm_ascend import envs
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.encoder_acl_graph import (
     get_encoder_forward_context,
@@ -42,6 +44,14 @@ MIN_PAD_SIZE: int = 64
 MAX_PAD_SIZE: int = 128
 SWA_INT_MAX: int = 2147483647
 FIA_BLOCK_SIZE: int = 128
+_SHARED_QK_PAD_HEAD_SIZE = 72
+_NPU_FORMAT_NCHW = 0
+_NPU_FORMAT_ND = 2
+
+
+def _npu_format_code(tensor: torch.Tensor) -> int:
+    tag = torch_npu.get_npu_format(tensor)
+    return getattr(tag, "value", tag)
 
 
 class AscendMMEncoderAttention(MMEncoderAttention):
@@ -72,6 +82,7 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         )
 
         self.enable_pad = self.head_size > MIN_PAD_SIZE and self.head_size < MAX_PAD_SIZE
+        self._fuse_vit_qk_padding = envs.VLLM_ASCEND_FUSE_VIT_QK_PADDING
 
     def _reshape_qkv_to_3d(
         self,
@@ -102,11 +113,44 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        *,
+        allow_shared_qk: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None]:
         if not self.enable_pad:
             return q, k, v, None
         origin_head_dim = q.shape[-1]
         pad_len = MAX_PAD_SIZE - origin_head_dim
+        if (
+            allow_shared_qk
+            and self._fuse_vit_qk_padding
+            and not torch.compiler.is_compiling()
+            and q.ndim == 3
+            and q.shape == k.shape == v.shape
+            and q.numel() > 0
+            and origin_head_dim == _SHARED_QK_PAD_HEAD_SIZE
+            and q.device.type == "npu"
+            and q.device == k.device == v.device
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.is_contiguous()
+            and k.is_contiguous()
+            and q.stride() == k.stride()
+            and k.storage_offset() == q.storage_offset() + q.numel()
+        ):
+            q_storage = q.untyped_storage()
+            # Q/K come from the two halves of the same RoPE output. The
+            # storage check rules out unrelated or physically padded inputs.
+            if (
+                q_storage.data_ptr() == k.untyped_storage().data_ptr()
+                and (k.storage_offset() + k.numel()) * k.element_size() <= q_storage.nbytes()
+                and _npu_format_code(q) in (_NPU_FORMAT_NCHW, _NPU_FORMAT_ND)
+                and _npu_format_code(k) in (_NPU_FORMAT_NCHW, _NPU_FORMAT_ND)
+                and _npu_format_code(v) == _NPU_FORMAT_ND
+            ):
+                qk = q.as_strided((2, *q.shape), (q.numel(), *q.stride()), q.storage_offset())
+                q, k = F.pad(qk, (0, pad_len), mode="constant", value=0).unbind(dim=0)
+                v = F.pad(v, (0, pad_len), mode="constant", value=0)
+                logger.info_once("ViT shared QK padding active: one Q/K pad and one V pad")
+                return q, k, v, origin_head_dim
         q = F.pad(q, (0, pad_len), mode="constant", value=0)
         k = F.pad(k, (0, pad_len), mode="constant", value=0)
         v = F.pad(v, (0, pad_len), mode="constant", value=0)
@@ -212,7 +256,7 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             key.shape[0],
             cudagraph_mm_encoder=False,
         )
-        q, k, v, origin_head_dim = self._maybe_pad_qkv(query, key, value)
+        q, k, v, origin_head_dim = self._maybe_pad_qkv(query, key, value, allow_shared_qk=True)
         context_layer = self._run_vit_fia(q, k, v, actual_seq_lengths_q, actual_seq_lengths_kv)
         context_layer = self._maybe_unpad_output(context_layer, origin_head_dim)
         return self._restore_batch_layout(

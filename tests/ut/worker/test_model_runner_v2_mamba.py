@@ -337,6 +337,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
         num_reqs_after_padding=4,
         num_tokens=2 * (num_spec + 1),
         num_tokens_after_padding=4 * (num_spec + 1),
+        is_dummy=False,
         is_prefilling_np=np.array([False, False]),
         has_prefill=False,
         idx_mapping=torch.tensor([0, 1]),
@@ -369,6 +370,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
     graph_requests = 4 if graph_mode == CUDAGraphMode.FULL else 2
     assert kwargs["num_reqs"] == graph_requests
     assert kwargs["num_tokens"] == graph_requests * (num_spec + 1)
+    assert kwargs["share_gdn_decode_columns"] == (graph_mode == CUDAGraphMode.FULL and num_spec == 0)
     model_metadata = kwargs["model_specific_attn_metadata"]
     if num_spec:
         assert model_metadata.num_decode_draft_tokens_cpu.tolist() == [num_spec] * graph_requests

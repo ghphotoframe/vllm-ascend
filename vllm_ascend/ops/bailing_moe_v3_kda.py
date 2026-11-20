@@ -29,6 +29,7 @@ from vllm_ascend.ops.kda_conv import (
     prepare_native_conv_decode,
     run_causal_conv1d,
 )
+from vllm_ascend.ops.kda_state_copy_plan import StridedKDAFallbackPlan
 from vllm_ascend.ops.triton.kda.accepted_state import rebase_short_kda_queries
 from vllm_ascend.ops.triton.kda.conv_state import (
     copy_conv_state,
@@ -59,19 +60,26 @@ def _zero_padded_spec_output(output: torch.Tensor, query_start_loc: torch.Tensor
 
 
 def _contiguous_packed_qkv(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, allow_row_gaps: bool = False
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    allow_row_gaps: bool = False,
+    num_actual_tokens: int | None = None,
 ) -> torch.Tensor:
     """Reuse adjacent projection slices when permitted by the caller.
 
     A projection may have columns after Q/K/V, creating row gaps. Only the
     native fixed-decode prepare path may defer compaction of such a view;
     native convolution itself still receives a dense buffer. A single row
-    is already contiguous. All checks use tensor metadata, without caching.
+    is already contiguous. Prefill can supply the valid row count to trim the
+    shared view before its one dense copy. All checks avoid caching.
     """
     if (
         q.ndim == k.ndim == v.ndim == 2
         and q.shape == k.shape == v.shape
         and q.shape[0] > 0
+        and (num_actual_tokens is None or 0 < num_actual_tokens <= q.shape[0])
         and q.dtype == k.dtype == v.dtype
         and q.device == k.device == v.device
         and not q.is_meta
@@ -85,9 +93,16 @@ def _contiguous_packed_qkv(
             and v.storage_offset() == q.storage_offset() + 2 * width
             and q.untyped_storage().data_ptr() == k.untyped_storage().data_ptr() == v.untyped_storage().data_ptr()
         ):
-            packed = q.as_strided((q.shape[0], 3 * width), q.stride(), storage_offset=q.storage_offset())
+            rows = q.shape[0] if num_actual_tokens is None else num_actual_tokens
+            packed = q.as_strided((rows, 3 * width), q.stride(), storage_offset=q.storage_offset())
             if packed.is_contiguous() or (allow_row_gaps and q.stride(0) >= 3 * width):
                 return packed
+            if num_actual_tokens is not None and q.stride(0) >= 3 * width:
+                return packed.contiguous()
+    if num_actual_tokens is not None:
+        return _contiguous_packed_qkv(
+            q[:num_actual_tokens], k[:num_actual_tokens], v[:num_actual_tokens], allow_row_gaps=allow_row_gaps
+        )
     return torch.cat((q, k, v), dim=-1)
 
 
@@ -639,7 +654,10 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
         state_copy = getattr(self, "_ascend_kda_state_copy", None)
         if state_copy is None or not getattr(self, "_kda_state_copy_ready", False):
             raise RuntimeError("KDA state copy requires worker cache initialization before prefill")
-        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state)
+        # Reuse offsets only for the immutable batch indices shared by KDA
+        # layers. Compacted indices and native plans retain their existing path.
+        copy_kwargs = {"reuse_offsets": True} if keep is None and isinstance(state_copy, StridedKDAFallbackPlan) else {}
+        initial_state = state_copy.gather(recurrent_state, state_indices, has_initial_state, **copy_kwargs)
         prefill_kwargs = {"lower_bound": self.lower_bound if self.safe_gate else None}
         if FLASH_KDA_ENABLED:
             if prebuilt_metadata.flash_cu_seqlens is None:
@@ -658,7 +676,7 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             self.dt_bias,
             **prefill_kwargs,
         )
-        state_copy.scatter(recurrent_state, final_state, state_indices)
+        state_copy.scatter(recurrent_state, final_state, state_indices, **copy_kwargs)
         return output
 
     @eager_break_during_capture
@@ -704,12 +722,23 @@ class AscendBailingMoeV3KimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                     decode_meta.causal_conv1d.query_start_loc,
                     self.num_speculative_tokens,
                 )
-        mixed_qkv = _contiguous_packed_qkv(
-            q_proj_states[:num_actual_tokens],
-            k_proj_states[:num_actual_tokens],
-            v_proj_states[:num_actual_tokens],
-            allow_row_gaps=defer_qkv_pack,
-        )
+        if (
+            getattr(self, "_ascend_fuse_input_projections", False)
+            and spec_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and q_proj_states.dtype == torch.bfloat16
+        ):
+            mixed_qkv = _contiguous_packed_qkv(
+                q_proj_states, k_proj_states, v_proj_states, num_actual_tokens=num_actual_tokens
+            )
+        else:
+            mixed_qkv = _contiguous_packed_qkv(
+                q_proj_states[:num_actual_tokens],
+                k_proj_states[:num_actual_tokens],
+                v_proj_states[:num_actual_tokens],
+                allow_row_gaps=defer_qkv_pack,
+            )
         # Keep the upstream custom-op keyword name (g1), while treating the
         # tensor as the raw gate required by the AscendC kernels.
         raw_gate = g1[:, :num_actual_tokens]

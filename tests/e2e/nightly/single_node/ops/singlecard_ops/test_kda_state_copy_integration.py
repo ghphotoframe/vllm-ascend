@@ -12,8 +12,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch_npu  # noqa: F401
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import override_forward_context
 
-from vllm_ascend.ops.kda_state_copy_plan import KDAStateCopyPlan, initialize_kda_state_copy
+from vllm_ascend.ops.kda_state_copy_plan import (
+    KDAStateCopyPlan,
+    StridedKDAFallbackPlan,
+    initialize_kda_state_copy,
+)
 from vllm_ascend.ops.triton import kda_state_copy_kernel as lowlevel
 
 
@@ -28,6 +34,55 @@ def _forbid_compilation(monkeypatch):
         module = importlib.import_module(name)
         if callable(getattr(module, "compile", None)):
             monkeypatch.setattr(module, "compile", forbidden)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_fallback_reuses_readonly_offsets_across_prefill_layers(dtype, index_dtype, monkeypatch):
+    backing = torch.arange(8 * 32 + 1, dtype=torch.float32, device="npu").to(dtype)
+    other_backing = backing + 5
+    layout = ((8, 1, 2, 3), (32, 6, 3, 1), 1)
+    state, other_state = backing.as_strided(*layout), other_backing.as_strided(*layout)
+    reference, other_reference = backing.clone(), other_backing.clone()
+    plan = StridedKDAFallbackPlan.prepare(state, 8)
+    plan.seal()
+    indices = torch.tensor([-1, 4, 2, 8], dtype=index_dtype, device="npu")
+    flags = torch.tensor([False, False, True, False], device="npu")
+    other_flags = torch.tensor([False, True, False, False], device="npu")
+    replacement = torch.randn((4, 1, 2, 3), dtype=torch.float32, device="npu")
+    e0_packed = plan.gather(reference.as_strided(*layout), indices, flags)
+    e0_other_packed = plan.gather(other_reference.as_strided(*layout), indices, other_flags)
+    plan.scatter(reference.as_strided(*layout), replacement, indices)
+    plan.scatter(other_reference.as_strided(*layout), -replacement, indices)
+
+    build_offsets = Mock(wraps=plan._build_offsets)
+    monkeypatch.setattr(plan, "_build_offsets", build_offsets)
+    context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE, ubatch_slices=None, additional_kwargs={})
+    with override_forward_context(context):
+        packed = plan.gather(state, indices, flags, reuse_offsets=True)
+        other_packed = plan.gather(other_state, indices, other_flags, reuse_offsets=True)
+        plan.scatter(state, replacement, indices, reuse_offsets=True)
+        plan.scatter(other_state, -replacement, indices, reuse_offsets=True)
+        assert build_offsets.call_count == 1
+    for actual, expected in (
+        (packed, e0_packed),
+        (other_packed, e0_other_packed),
+        (backing, reference),
+        (other_backing, other_reference),
+    ):
+        assert torch.equal(actual.cpu().view(torch.uint8), expected.cpu().view(torch.uint8))
+
+    # The runner may reuse the backing metadata buffer between forwards.
+    # A new context must handle changed values even with the same tensor object.
+    indices.fill_(7)
+    flags.fill_(True)
+    next_context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE, ubatch_slices=None, additional_kwargs={})
+    with override_forward_context(next_context):
+        next_packed = plan.gather(state, indices, flags, reuse_offsets=True)
+        assert build_offsets.call_count == 2
+    next_expected = state[7].expand_as(next_packed).contiguous()
+    assert torch.equal(next_packed.cpu().view(torch.uint8), next_expected.cpu().view(torch.uint8))
 
 
 @pytest.mark.parametrize("to_cache", [False, True])

@@ -30,7 +30,7 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
@@ -55,6 +55,32 @@ def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
         # AiCore without changing the ordering of tokens within either group.
         tensor = tensor.to(torch.float32)
     return torch.argsort(tensor, stable=True)
+
+
+def _gdn_block_table(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cache_spec: AttentionSpec,
+    cache_mode: str,
+    batch_decode_columns: dict[tuple[int, int], torch.Tensor] | None,
+) -> torch.Tensor:
+    if (
+        batch_decode_columns is None
+        or cache_mode != "align"
+        or not isinstance(cache_spec, MambaSpec)
+        or cache_spec.num_speculative_blocks != 0
+    ):
+        return mamba_get_block_table_tensor(block_table, seq_lens, cache_spec, cache_mode)
+
+    # Each group's seq_lens is a prefix of the same batch-owned length tensor.
+    # The physical block table still differs by group.
+    key = (seq_lens.shape[0], cache_spec.block_size)
+    columns = batch_decode_columns.get(key)
+    if columns is None:
+        starts = (seq_lens - 1) // cache_spec.block_size
+        columns = starts.clamp_(min=0).unsqueeze(1).to(torch.int64)
+        batch_decode_columns[key] = columns
+    return torch.gather(block_table, 1, columns)
 
 
 def _remove_spec_graph_padding_queries(
@@ -694,6 +720,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
         num_actual_reqs: int | None = None,
+        batch_decode_columns: dict[tuple[int, int], torch.Tensor] | None = None,
     ) -> GDNAttentionMetadata:
         # Normalize FIA's full-width dummy queries before slicing requests:
         # its common token count may still include those inactive rows.
@@ -723,11 +750,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
-        block_table_tensor = mamba_get_block_table_tensor(
+        block_table_tensor = _gdn_block_table(
             m.block_table_tensor,
             m.seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
+            None if self.use_spec_decode else batch_decode_columns,
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
