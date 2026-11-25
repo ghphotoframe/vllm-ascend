@@ -28,19 +28,6 @@ class LeaseReleaseResult(Enum):
     REJECTED = auto()
 
 
-class SeedRemovalResult(Enum):
-    REMOVED = auto()
-    ABSENT = auto()
-    DRAINING = auto()
-    UNSUPPORTED = auto()
-    UNCONFIRMED = auto()
-    RETRYABLE = auto()
-    REJECTED = auto()
-
-    def __bool__(self) -> bool:
-        return self in (SeedRemovalResult.REMOVED, SeedRemovalResult.ABSENT)
-
-
 class SeedReportStatus(Enum):
     ACCEPTED = auto()
     RETRYABLE = auto()
@@ -101,8 +88,7 @@ class SeedLease:
     user_id: str
     seed_rank: int
     seed_key: str
-    # Legacy planners hold the allocation until put_seed, without expiry or renewal.
-    lease_ttl_sec: float | None = None
+    lease_ttl_sec: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
