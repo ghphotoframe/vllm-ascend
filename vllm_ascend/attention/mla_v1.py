@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.offloader.base import NoopOffloader, get_offloader
 from vllm.model_executor.utils import replace_parameter
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
@@ -28,6 +29,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -97,6 +99,7 @@ if TYPE_CHECKING:
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 MLA_KERNEL_BLOCK_SIZE = 128
+LING_MLA_CACHE_WIDTHS = (512, 64)
 
 # Exclusive batch * K limit of the fused op with perm_x1=(1, 0, 2).
 TRANSPOSE_BMM_MAX_SUPPORTED_DIM = 65536
@@ -992,6 +995,19 @@ class PrefillMLAPreprocessResult(NamedTuple):
     value: torch.Tensor | None = None
 
 
+@triton.jit
+def _ling_mla_kv_write(
+    dst, src, slots, blocks: tl.constexpr, block_size: tl.constexpr, page_stride: tl.constexpr, width: tl.constexpr
+):
+    token = tl.program_id(0)
+    slot = tl.load(slots + token).to(tl.int64)
+    valid = (slot >= 0) & (slot < blocks * block_size)
+    columns = tl.arange(0, width)
+    values = tl.load(src + token * width + columns)
+    row_offset = (slot // block_size) * page_stride + (slot % block_size) * width
+    tl.store(dst + row_offset + columns, values, mask=valid)
+
+
 class AscendMLAImpl(MLAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -1878,6 +1894,14 @@ class AscendMLAImpl(MLAAttentionImpl):
             if return_current_kv:
                 return kv_cache[1], kv_cache[0], current_k_pe, current_k_nope
             return kv_cache[1], kv_cache[0]
+        if (
+            not return_current_kv
+            and self._uses_ling_text_decode_strided_kv_writer()
+            and self._is_component_major_ling_cache(kv_cache)
+        ):
+            logger.info_once("Ling BF16 MLA decode uses physical-row KV scatter")
+            self._exec_strided_kv_writer(kv_no_split, cos, sin, kv_cache, slots, use_physical_rows=True)
+            return kv_cache[1], kv_cache[0]
         if not self.use_mla_rope:
             current_k_pe, current_k_nope = self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
             if return_current_kv:
@@ -2097,10 +2121,61 @@ class AscendMLAImpl(MLAAttentionImpl):
             self._uses_strided_kv_adapter() and getattr(self, "_strided_kv_workspace", None) is not None
         )
 
+    def _uses_ling_text_decode_strided_kv_writer(self) -> bool:
+        """Restrict the experimental writer to the tested Ling decode contract."""
+        if not envs.VLLM_ASCEND_LING_TEXT_STRIDED_KV_EXPERIMENT:
+            return False
+        config = self.vllm_config
+        hf_config = config.model_config.hf_config
+        return (
+            getattr(hf_config, "model_type", None) == "bailing_hybrid"
+            and "BailingMoeV3ForCausalLM" in (getattr(hf_config, "architectures", None) or ())
+            and self.q_lora_rank is None
+            and self.fused_qkv_a_proj is None
+            and self.use_mla_rope
+            and (self.kv_lora_rank, self.qk_rope_head_dim) == LING_MLA_CACHE_WIDTHS
+            and not getattr(self.rotary_emb, "uses_mla_mrope", False)
+            and self.dtype == torch.bfloat16
+            and self.kv_a_layernorm is not None
+            and self.num_kv_heads == 1
+            and config.parallel_config.decode_context_parallel_size == 2
+            and self.speculative_config is None
+            and config.kv_transfer_config is None
+            and not self.is_draft_model
+            and not self.pcp_enabled
+            and not self.is_pcp_decode_sharded
+            and not self.fa_quant_layer
+            and not self.enable_kv_nz
+        )
+
+    def _is_component_major_ling_cache(self, kv_cache) -> bool:
+        """Accept gaps between pages while requiring dense rows within each page."""
+        if not isinstance(kv_cache, tuple) or len(kv_cache) != 2:
+            return False
+        for cache, width in zip(kv_cache, (self.kv_lora_rank, self.qk_rope_head_dim)):
+            if (
+                cache.ndim != 4
+                or cache.dtype != self.dtype
+                or cache.shape[2:] != (1, width)
+                or cache.stride()[1:] != (width, width, 1)
+                or cache.stride(0) < cache.shape[1] * width
+            ):
+                return False
+        key, rope = kv_cache
+        return (
+            key.shape[:2] == rope.shape[:2]
+            and key.stride(0) == rope.stride(0)
+            and (not key.is_contiguous() or not rope.is_contiguous())
+        )
+
     def _prepare_strided_kv_workspace(self) -> None:
         """Allocate during weight loading, before KV sizing, and retain graph addresses."""
         if (
-            not (self._uses_strided_kv_adapter() or self._uses_bounded_projected_kv_writer())
+            not (
+                self._uses_strided_kv_adapter()
+                or self._uses_bounded_projected_kv_writer()
+                or self._uses_ling_text_decode_strided_kv_writer()
+            )
             or getattr(self, "_strided_kv_workspace", None) is not None
         ):
             return
@@ -2118,7 +2193,14 @@ class AscendMLAImpl(MLAAttentionImpl):
             torch.arange(capacity, dtype=torch.int64, device=device),
         )
 
-    def _exec_strided_kv_writer(self, kv_no_split, cos, sin, kv_cache, slots):
+    @staticmethod
+    def _write_ling_mla_physical_rows(cache, slots, current_rows):
+        blocks, block_size, _, width = cache.shape
+        _ling_mla_kv_write[(slots.numel(),)](
+            cache, current_rows.contiguous(), slots.contiguous(), blocks, block_size, cache.stride(0), width
+        )
+
+    def _exec_strided_kv_writer(self, kv_no_split, cos, sin, kv_cache, slots, *, use_physical_rows=False):
         """Normalize/rotate only current rows, then scatter into the original views."""
         workspace = self._strided_kv_workspace
         if workspace is None:
@@ -2158,13 +2240,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
         current_nope = nope.flatten(0, 1)[:num_tokens]
         current_rope = rope.flatten(0, 1)[:num_tokens]
-        DeviceOperator.reshape_and_cache(
-            key=current_nope,
-            value=current_rope,
-            key_cache=kv_cache[0],
-            value_cache=kv_cache[1],
-            slot_mapping=slots,
-        )
+        if use_physical_rows:
+            self._write_ling_mla_physical_rows(kv_cache[0], slots, current_nope)
+            self._write_ling_mla_physical_rows(kv_cache[1], slots, current_rope)
+        else:
+            DeviceOperator.reshape_and_cache(
+                key=current_nope,
+                value=current_rope,
+                key_cache=kv_cache[0],
+                value_cache=kv_cache[1],
+                slot_mapping=slots,
+            )
         return current_rope, current_nope
 
     def _prepare_prolog_v3_weights(self) -> dict[str, Any]:

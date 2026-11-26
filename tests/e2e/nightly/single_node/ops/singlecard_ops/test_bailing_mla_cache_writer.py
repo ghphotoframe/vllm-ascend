@@ -19,11 +19,11 @@ FUSED_DIM = NOPE_DIM + ROPE_DIM
 SENTINEL = -37
 
 
-def _impl(dcp_enabled=False):
+def _impl(dcp_enabled=False, ling_text=False):
     torch.npu.set_device(0)
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
     impl.layer_name = "model.layers.0.self_attn.attn"
-    impl.rotary_emb = SimpleNamespace(uses_mla_mrope=True)
+    impl.rotary_emb = SimpleNamespace(uses_mla_mrope=not ling_text)
     impl.q_lora_rank = impl.fused_qkv_a_proj = impl.q_a_layernorm = None
     impl.support_fp8_attention = impl.is_draft_model = False
     impl.use_mla_rope = True
@@ -39,11 +39,49 @@ def _impl(dcp_enabled=False):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         compilation_config=SimpleNamespace(cudagraph_capture_sizes=[4, 16]),
         cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="bailing_hybrid", architectures=["BailingMoeV3ForCausalLM"])
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2 if dcp_enabled else 1),
+        kv_transfer_config=None,
     )
+    impl.is_pcp_decode_sharded = False
     impl._strided_kv_workspace = None
     impl._prepare_strided_kv_workspace()
-    assert impl._uses_strided_kv_adapter()
+    assert impl._uses_ling_text_decode_strided_kv_writer() if ling_text else impl._uses_strided_kv_adapter()
     return impl
+
+
+@torch.inference_mode()
+def test_ling_text_decode_updates_physical_rows_under_graph_replay(monkeypatch):
+    flag = "VLLM_ASCEND_LING_TEXT_STRIDED_KV_EXPERIMENT"
+    monkeypatch.setenv(flag, "1")
+    impl = _impl(dcp_enabled=True, ling_text=True)
+    backing, cache = _cache("component_major", offset=16)
+    kv, cos, sin, slots = _inputs()
+    assert impl._is_component_major_ling_cache(cache)
+    monkeypatch.setenv(flag, "0")
+    assert not impl._uses_ling_text_decode_strided_kv_writer()
+    monkeypatch.setenv(flag, "1")
+    impl.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    assert not impl._uses_ling_text_decode_strided_kv_writer()
+    impl.speculative_config = None
+
+    history_rope, history_nope = impl.exec_kv_decode(kv, cos, sin, cache, slots)
+    assert history_rope is cache[1] and history_nope is cache[0]
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        impl.exec_kv_decode(kv, cos, sin, cache, slots)
+
+    for current_slots in ([BLOCK_SIZE - 1, BLOCK_SIZE, -1, 2 * BLOCK_SIZE + 5], [-1] * 4):
+        backing.fill_(SENTINEL)
+        kv.normal_()
+        slots.copy_(torch.tensor(current_slots, device="npu"))
+        expected = _expected_backing(backing, cache, slots, _dense_reference(impl, kv, cos, sin))
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
 
 
 def _cache(layout, blocks=3, offset=16):
