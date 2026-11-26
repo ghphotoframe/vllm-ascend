@@ -1047,6 +1047,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.vllm_config = get_current_vllm_config()
         self.layerwise_kv_cache_hook: Any = None
         self._strided_kv_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._ling_draft_prefill_kv_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self.support_fp8_attention = get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
         self.num_heads = num_heads
         self.head_size = head_size
@@ -1895,12 +1896,20 @@ class AscendMLAImpl(MLAAttentionImpl):
                 return kv_cache[1], kv_cache[0], current_k_pe, current_k_nope
             return kv_cache[1], kv_cache[0]
         if (
-            not return_current_kv
+            (not return_current_kv or self.speculative_config is not None)
             and self._uses_ling_text_decode_strided_kv_writer()
             and self._is_component_major_ling_cache(kv_cache)
         ):
-            logger.info_once("Ling BF16 MLA decode uses physical-row KV scatter")
-            self._exec_strided_kv_writer(kv_no_split, cos, sin, kv_cache, slots, use_physical_rows=True)
+            logger.info_once(
+                "Ling BF16 MLA decode uses physical-row KV scatter (%s)", "draft" if self.is_draft_model else "target"
+            )
+            current_k_pe, current_k_nope = self._exec_strided_kv_writer(
+                kv_no_split, cos, sin, kv_cache, slots, use_physical_rows=True
+            )
+            # DCP attends to the whole current query block, including rows
+            # whose paged slot is -1 on this rank. Only the cache write is masked.
+            if return_current_kv:
+                return kv_cache[1], kv_cache[0], current_k_pe, current_k_nope
             return kv_cache[1], kv_cache[0]
         if not self.use_mla_rope:
             current_k_pe, current_k_nope = self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
@@ -2122,11 +2131,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
     def _uses_ling_text_decode_strided_kv_writer(self) -> bool:
-        """Restrict the experimental writer to the tested Ling decode contract."""
+        """Select the Ling text BF16 DCP writer, including its own MTP drafter."""
         if not envs.VLLM_ASCEND_LING_TEXT_STRIDED_KV_EXPERIMENT:
             return False
         config = self.vllm_config
         hf_config = config.model_config.hf_config
+        speculative = self.speculative_config
+        if speculative is not None:
+            if speculative.method != "mtp":
+                return False
+            target = speculative.target_model_config
+            if target is not None:
+                hf_config = target.hf_config
+            if self.is_draft_model:
+                draft = speculative.draft_model_config
+                if draft is None or "BailingMoeV3MTPModel" not in (getattr(draft.hf_config, "architectures", None) or ()):
+                    return False
+        elif self.is_draft_model:
+            return False
         return (
             getattr(hf_config, "model_type", None) == "bailing_hybrid"
             and "BailingMoeV3ForCausalLM" in (getattr(hf_config, "architectures", None) or ())
@@ -2139,9 +2161,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             and self.kv_a_layernorm is not None
             and self.num_kv_heads == 1
             and config.parallel_config.decode_context_parallel_size == 2
-            and self.speculative_config is None
             and config.kv_transfer_config is None
-            and not self.is_draft_model
             and not self.pcp_enabled
             and not self.is_pcp_decode_sharded
             and not self.fa_quant_layer
@@ -2170,15 +2190,18 @@ class AscendMLAImpl(MLAAttentionImpl):
 
     def _prepare_strided_kv_workspace(self) -> None:
         """Allocate during weight loading, before KV sizing, and retain graph addresses."""
+        uses_ling_writer = self._uses_ling_text_decode_strided_kv_writer()
         if (
-            not (
-                self._uses_strided_kv_adapter()
-                or self._uses_bounded_projected_kv_writer()
-                or self._uses_ling_text_decode_strided_kv_writer()
-            )
-            or getattr(self, "_strided_kv_workspace", None) is not None
+            getattr(self, "_strided_kv_workspace", None) is None
+            and (self._uses_strided_kv_adapter() or self._uses_bounded_projected_kv_writer() or uses_ling_writer)
         ):
-            return
+            self._strided_kv_workspace = self._allocate_strided_kv_workspace()
+        if uses_ling_writer and self.is_draft_model and self._ling_draft_prefill_kv_workspace is None:
+            # Mixed draft batches can retain current KV from both paths until
+            # attention runs. Prefill must not overwrite decode's returned rows.
+            self._ling_draft_prefill_kv_workspace = self._allocate_strided_kv_workspace()
+
+    def _allocate_strided_kv_workspace(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.kv_a_layernorm is not None
         capacity = max(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
@@ -2187,7 +2210,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         block_size = self.vllm_config.cache_config.block_size
         shape = (cdiv(capacity, block_size), block_size, self.num_kv_heads)
         device = self.kv_a_layernorm.weight.device
-        self._strided_kv_workspace = (
+        return (
             torch.empty((*shape, self.kv_lora_rank), dtype=self.dtype, device=device),
             torch.empty((*shape, self.qk_rope_head_dim), dtype=self.dtype, device=device),
             torch.arange(capacity, dtype=torch.int64, device=device),
@@ -2200,9 +2223,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             cache, current_rows.contiguous(), slots.contiguous(), blocks, block_size, cache.stride(0), width
         )
 
-    def _exec_strided_kv_writer(self, kv_no_split, cos, sin, kv_cache, slots, *, use_physical_rows=False):
+    def _exec_strided_kv_writer(self, kv_no_split, cos, sin, kv_cache, slots, *, use_physical_rows=False, workspace=None):
         """Normalize/rotate only current rows, then scatter into the original views."""
-        workspace = self._strided_kv_workspace
+        if workspace is None:
+            workspace = self._strided_kv_workspace
         if workspace is None:
             raise RuntimeError("Strided MLA KV workspace must be prepared before KV cache sizing.")
         nope, rope, indices = workspace
@@ -2930,6 +2954,17 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if not self.use_mla_rope:
             k_pe, k_nope = self._exec_kv_no_rope(kv_no_split, kv_cache, slots)
+        elif (
+            self._uses_ling_text_decode_strided_kv_writer()
+            and self.is_draft_model
+            and self._is_component_major_ling_cache(kv_cache)
+        ):
+            workspace = self._ling_draft_prefill_kv_workspace
+            assert workspace is not None
+            logger.info_once("Ling BF16 MLA draft prefill uses physical-row KV scatter")
+            k_pe, k_nope = self._exec_strided_kv_writer(
+                kv_no_split, cos, sin, kv_cache, slots, use_physical_rows=True, workspace=workspace
+            )
         elif (self._uses_strided_kv_adapter() or self._uses_bounded_projected_kv_writer()) and any(
             not cache.is_contiguous() for cache in kv_cache
         ):

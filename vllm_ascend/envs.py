@@ -93,7 +93,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # change it. Requires the external FlashKDA V1/PyPTO package. A2/A3/310P
     # reject explicit enablement. Kimi/GLM and recurrent KDA are unaffected.
     "VLLM_ASCEND_ENABLE_FLASH_KDA": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_KDA"),
-    # Experimental current-token MLA cache writes for Ling text BF16 decode.
+    # Experimental current-token MLA cache writes for Ling text BF16 DCP decode and MTP.
     # Default: 0; valid: 0 or 1. Not sensitive. Set before worker startup.
     "VLLM_ASCEND_LING_TEXT_STRIDED_KV_EXPERIMENT": lambda: _strict_binary_env(
         "VLLM_ASCEND_LING_TEXT_STRIDED_KV_EXPERIMENT"
